@@ -833,6 +833,117 @@ void ColumnObject::deserializeValueFromSharedData(const ColumnString * shared_da
     getDynamicSerialization()->deserializeBinary(column, buf, getFormatSettings());
 }
 
+void ColumnObject::mergeObjectColumns(ColumnObject & dest_object, const ColumnObject & source_object, size_t /* dest_row */, size_t source_row)
+{
+    /// Merge typed paths
+    for (const auto & [path, source_col] : source_object.getTypedPaths())
+    {
+        auto it = dest_object.getTypedPaths().find(path);
+        if (it != dest_object.getTypedPaths().end())
+        {
+            /// Path exists in destination, replace value
+            auto & dest_col = it->second;
+            dest_col->popBack(1);  /// Remove old value
+            dest_col->insertFrom(*source_col, source_row);
+        }
+        else
+        {
+            /// Typed paths are statically defined in the schema, so both source and dest
+            /// should have the same typed paths. If they don't match, it indicates a schema
+            /// mismatch or data corruption.
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Typed path '{}' exists in source ColumnObject but not in destination. "
+                "This indicates a schema mismatch between aggregation states.",
+                path);
+        }
+    }
+    
+    /// Merge dynamic paths
+    for (const auto & [path, source_dynamic_col] : source_object.getDynamicPathsPtrs())
+    {
+        auto & dest_dynamic_paths = dest_object.getDynamicPathsPtrs();
+        auto it = dest_dynamic_paths.find(path);
+        
+        /// Per RFC 7396: null values delete keys
+        if (source_dynamic_col->isNullAt(source_row))
+        {
+            if (it != dest_dynamic_paths.end())
+            {
+                /// Path exists in destination, set it to null (delete semantics)
+                auto * dest_dynamic_col = it->second;
+                dest_dynamic_col->popBack(1);
+                dest_dynamic_col->insertDefault();  /// Insert null
+            }
+            /// If path doesn't exist in dest, nothing to delete
+            continue;
+        }
+        
+        if (it != dest_dynamic_paths.end())
+        {
+            /// Path exists in destination, replace value
+            auto * dest_dynamic_col = it->second;
+            dest_dynamic_col->popBack(1);
+            dest_dynamic_col->insertFrom(*source_dynamic_col, source_row);
+        }
+        else
+        {
+            /// Path doesn't exist in destination
+            /// Try to add it to dynamic paths if possible, otherwise add to shared data
+            auto * new_dynamic_col = dest_object.tryToAddNewDynamicPath(path);
+            if (new_dynamic_col)
+            {
+                /// Successfully added as dynamic path
+                /// tryToAddNewDynamicPath already filled it with defaults
+                /// We need to replace the default at dest_row with the actual value
+                new_dynamic_col->popBack(1);  // Remove the default at the last position (dest_row)
+                new_dynamic_col->insertFrom(*source_dynamic_col, source_row);
+            }
+            else
+            {
+                /// Cannot add as dynamic path, add to shared data instead
+                auto [dest_paths, dest_values] = dest_object.getSharedDataPathsAndValues();
+                
+                /// Serialize the value from source dynamic column into dest shared data
+                ColumnObject::serializePathAndValueIntoSharedData(dest_paths, dest_values, path, *source_dynamic_col, source_row);
+            }
+        }
+    }
+    
+    /// Merge shared data paths
+    const auto [source_paths, source_values] = source_object.getSharedDataPathsAndValues();
+    const auto & source_offsets = source_object.getSharedDataOffsets();
+    size_t start = source_row == 0 ? 0 : source_offsets[source_row - 1];
+    size_t end = source_offsets[source_row];
+    
+    for (size_t i = start; i < end; ++i)
+    {
+        std::string_view path = source_paths->getDataAt(i);
+        
+        /// Try to add to dynamic paths first
+        auto * dest_dynamic_col = dest_object.tryToAddNewDynamicPath(path);
+        if (dest_dynamic_col)
+        {
+            /// Successfully added as dynamic path
+            /// tryToAddNewDynamicPath already filled it with defaults
+            /// We need to replace the default at dest_row with the actual value
+            dest_dynamic_col->popBack(1);  // Remove the default at the last position
+            ColumnObject::deserializeValueFromSharedData(source_values, i, *dest_dynamic_col);
+        }
+        else
+        {
+            /// Add to shared data (ColumnObject handles this)
+            /// We need to update the shared data in dest_object
+            auto [dest_paths, dest_values] = dest_object.getSharedDataPathsAndValues();
+            dest_paths->insertData(path.data(), path.size());
+            dest_values->insertFrom(*source_values, i);
+        }
+    }
+    
+    /// Update shared data offsets to reflect the new shared data count
+    auto & dest_offsets = dest_object.getSharedDataOffsets();
+    dest_offsets.back() = dest_object.getSharedDataPathsAndValues().first->size();
+}
+
 void ColumnObject::insertDefault()
 {
     /// Exception-safe: if some sub-column's insertDefault throws (e.g. on a memory limit),

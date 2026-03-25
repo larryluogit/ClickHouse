@@ -279,6 +279,19 @@ public:
     static void serializePathAndValueIntoSharedData(ColumnString * shared_data_paths, ColumnString * shared_data_values, std::string_view path, const ColumnDynamic & column, size_t n);
     static void deserializeValueFromSharedData(const ColumnString * shared_data_values, size_t n, IColumn & column);
 
+    /// Merge source_object[source_row] into dest_object[dest_row] using JSON Merge Patch semantics (RFC 7396)
+    ///
+    /// RFC 7396 semantics fully implemented:
+    /// - Non-object values (including arrays) replace destination values atomically
+    /// - Null values delete keys (set them to null in ColumnObject)
+    /// - Objects are merged recursively (union of paths with source values taking precedence)
+    ///
+    /// Note: ColumnObject stores JSON as flattened paths (e.g., "user.name", "user.age"),
+    /// so merging path-by-path naturally achieves recursive object merging at the JSON level.
+    /// For example, merging {"user": {"name": "Bob"}} into {"user": {"name": "Alice", "age": 30}}
+    /// works by merging the flattened paths: "user.name" and "user.age".
+    static void mergeObjectColumns(ColumnObject & dest_object, const ColumnObject & source_object, size_t dest_row, size_t source_row);
+
     /// Paths in shared data are sorted in each row. Use this method to find the lower bound for specific path in the row.
     static size_t findPathLowerBoundInSharedData(std::string_view path, const ColumnString & shared_data_paths, size_t start, size_t end);
     /// Insert all the data from shared data with specified path to dynamic column.
