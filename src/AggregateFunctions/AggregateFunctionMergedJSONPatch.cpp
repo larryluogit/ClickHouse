@@ -1,19 +1,15 @@
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/IAggregateFunction.h>
+#include <Common/FieldVisitorToString.h>
 #include <AggregateFunctions/FactoryHelpers.h>
 #include <Columns/ColumnObject.h>
-#include <Columns/ColumnDynamic.h>
 #include <DataTypes/DataTypeObject.h>
 #include <DataTypes/DataTypeDynamic.h>
 #include <IO/WriteHelpers.h>
 #include <IO/ReadHelpers.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/ReadBufferFromString.h>
-#include <Common/PODArray.h>
 #include <Common/Arena.h>
+#include <Common/Exception.h>
 #include <Core/Field.h>
-#include <base/sort.h>
-#include <numeric>
 
 
 namespace DB
@@ -29,19 +25,68 @@ namespace ErrorCodes
 
 struct AggregateFunctionMergedJSONPatchData
 {
-    /// Store ColumnObject instances paired with their sort keys
-    struct ObjectWithKey
+    /// `JSON` / `ColumnObject` cannot insert arrays that mix scalar elements with nested `JSON`
+    /// object elements, because array element type inference ends up with incompatible `String`
+    /// and `JSON` types. `mergedJSONPatch` follows RFC 7396 and keeps arrays as atomic replacement
+    /// values, so a heterogeneous source array can survive unchanged until aggregate finalization.
+    ///
+    /// To avoid `NO_COMMON_TYPE` during final insertion of the aggregate result, recursively detect
+    /// arrays that contain both object and non-object elements and stringify only the object
+    /// elements. This preserves RFC 7396 replacement semantics for the array as a whole while
+    /// converting it to a representation that the current `JSON` type can store.
+    static void normalizeMixedJSONArray(Field & value)
     {
-        MutableColumnPtr object_column;  /// Stores single ColumnObject row
-        Field sort_key;
+        if (value.getType() != Field::Types::Array)
+            return;
+
+        auto & array = value.safeGet<Array>();
+        bool has_object = false;
+        bool has_non_object = false;
+
+        for (auto & element : array)
+        {
+            normalizeMixedJSONArray(element);
+
+            if (element.getType() == Field::Types::Object)
+                has_object = true;
+            else
+                has_non_object = true;
+        }
+
+        if (has_object && has_non_object)
+        {
+            for (auto & element : array)
+            {
+                if (element.getType() == Field::Types::Object)
+                    element = Field(convertObjectToString(element.safeGet<Object>()));
+            }
+        }
+    }
+
+    /// Store triplets: (key, value, sorting_key)
+    /// Each key only keeps the latest record according to sorting_key.
+    /// This implements last-write-wins semantics at the path level, which is the core merge
+    /// behavior of RFC 7396 JSON Merge Patch, and enables distributed queries to work correctly
+    /// by merging states at the final stage.
+    ///
+    /// LIMITATION: RFC 7396 null deletion semantics (where `{"key": null}` removes a key) are NOT supported.
+    /// When a JSON object like `{"key": null}` is inserted into ColumnObject, the null-valued
+    /// key is silently dropped (see ColumnObject::insert() lines 495-504). ColumnObject
+    /// cannot distinguish between "key is absent" and "key has null value", treating them
+    /// as equivalent. Therefore, this aggregate function cannot detect or handle null deletion.
+    struct ValueWithSortKey
+    {
+        Field value;         /// The JSON value for this path
+        Field sort_key;      /// Sorting key to determine which value is latest
         
-        bool operator<(const ObjectWithKey & other) const
+        bool operator<(const ValueWithSortKey & other) const
         {
             return sort_key < other.sort_key;
         }
     };
     
-    std::vector<ObjectWithKey> values;
+    /// Map from JSON path (key) to its value and sort key
+    UnorderedMapWithMemoryTracking<String, ValueWithSortKey> key_value_map;
     size_t max_dynamic_paths;
     size_t max_dynamic_types;
 
@@ -62,56 +107,120 @@ struct AggregateFunctionMergedJSONPatchData
     {
         const auto & object_column = assert_cast<const ColumnObject &>(json_column);
         
-        /// Create a single-row ColumnObject by extracting the row
-        auto single_row_column = object_column.cloneEmpty();
-        single_row_column->insertFrom(object_column, row_num);
-        
         /// Use a serialized representation of the object as sort key for deterministic ordering
         const char * begin = nullptr;
         auto serialized = object_column.serializeValueIntoArena(row_num, *arena, begin, nullptr);
+        Field sort_key = Field(String(serialized));
         
-        values.emplace_back(ObjectWithKey{std::move(single_row_column), Field(String(serialized))});
+        /// Extract all key-value pairs from the JSON object
+        addKeyValuePairs(object_column, row_num, sort_key);
     }
 
     void addWithKey(const IColumn & json_column, const IColumn & key_column, size_t row_num, Arena *)
     {
         const auto & object_column = assert_cast<const ColumnObject &>(json_column);
         
-        /// Create a single-row ColumnObject
-        auto single_row_column = object_column.cloneEmpty();
-        single_row_column->insertFrom(object_column, row_num);
-        
         /// Get sort key
         Field sort_key = key_column[row_num];
         
-        values.emplace_back(ObjectWithKey{std::move(single_row_column), sort_key});
+        /// Extract all key-value pairs from the JSON object
+        addKeyValuePairs(object_column, row_num, sort_key);
+    }
+
+    static bool isPathPrefix(std::string_view prefix, std::string_view path)
+    {
+        return path.size() > prefix.size()
+            && path.starts_with(prefix)
+            && path[prefix.size()] == '.';
+    }
+
+    void removeConflictingPaths(std::string_view key, const Field & sort_key)
+    {
+        for (auto it = key_value_map.begin(); it != key_value_map.end();)
+        {
+            if (isPathPrefix(key, it->first) || isPathPrefix(it->first, key))
+            {
+                if (it->second.sort_key <= sort_key)
+                    it = key_value_map.erase(it);
+                else
+                    ++it;
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    bool hasNewerConflictingPath(std::string_view key, const Field & sort_key) const
+    {
+        for (const auto & [existing_key, value_with_key] : key_value_map)
+        {
+            if ((isPathPrefix(key, existing_key) || isPathPrefix(existing_key, key)) && value_with_key.sort_key > sort_key)
+                return true;
+        }
+
+        return false;
+    }
+
+    void upsertPathValue(String key, Field value, const Field & sort_key)
+    {
+        auto map_it = key_value_map.find(key);
+        if (map_it != key_value_map.end() && map_it->second.sort_key > sort_key)
+            return;
+
+        if (hasNewerConflictingPath(key, sort_key))
+            return;
+
+        removeConflictingPaths(key, sort_key);
+        key_value_map.insert_or_assign(std::move(key), ValueWithSortKey{std::move(value), sort_key});
+    }
+
+    void addKeyValuePairs(const ColumnObject & object_column, size_t row_num, const Field & sort_key)
+    {
+        /// Use SortedPathsIterator to iterate over all paths (typed + dynamic + shared data)
+        ColumnObject::SortedPathsIterator it(object_column, row_num);
+        while (!it.end())
+        {
+            auto path_info = it.getCurrentPathInfo();
+            String key(path_info.path);
+
+            /// Get the value for this path
+            Field value;
+            path_info.column->get(path_info.row, value);
+            normalizeMixedJSONArray(value);
+
+            upsertPathValue(std::move(key), std::move(value), sort_key);
+
+            it.next();
+        }
     }
 
     void merge(const AggregateFunctionMergedJSONPatchData & other, Arena *)
     {
-        /// Concatenate all values from other state
-        for (const auto & item : other.values)
-        {
-            /// Clone the column to avoid shared ownership issues
-            values.emplace_back(ObjectWithKey{item.object_column->cloneResized(item.object_column->size()), item.sort_key});
-        }
+        /// Merge key-value pairs from other state, keeping only the latest for each key.
+        /// This implements last-write-wins semantics (RFC 7396 core behavior): for each path,
+        /// the value with the largest sorting_key wins, which is equivalent to merging objects
+        /// in sorted order. Note: RFC 7396 null deletion is not supported (see limitation above).
+        for (const auto & [key, value_with_key] : other.key_value_map)
+            upsertPathValue(key, value_with_key.value, value_with_key.sort_key);
     }
 
     void serialize(WriteBuffer & buf) const
     {
-        size_t size = values.size();
+        size_t size = key_value_map.size();
         writeVarUInt(size, buf);
-        for (const auto & item : values)
+        
+        for (const auto & [key, value_with_key] : key_value_map)
         {
-            /// Serialize the ColumnObject
-            const auto & object_col = assert_cast<const ColumnObject &>(*item.object_column);
-            Arena arena;
-            const char * begin = nullptr;
-            auto serialized = object_col.serializeValueIntoArena(0, arena, begin, nullptr);
-            writeStringBinary(serialized, buf);
+            /// Serialize key (path)
+            writeStringBinary(key, buf);
+            
+            /// Serialize value
+            writeFieldBinary(value_with_key.value, buf);
             
             /// Serialize sort key
-            writeFieldBinary(item.sort_key, buf);
+            writeFieldBinary(value_with_key.sort_key, buf);
         }
     }
 
@@ -119,65 +228,72 @@ struct AggregateFunctionMergedJSONPatchData
     {
         size_t size = 0;
         readVarUInt(size, buf);
-        values.reserve(size);
+        key_value_map.reserve(size);
         
         for (size_t i = 0; i < size; ++i)
         {
-            /// Deserialize ColumnObject
-            String serialized_data;
-            readStringBinary(serialized_data, buf);
+            /// Deserialize key (path)
+            String key;
+            readStringBinary(key, buf);
             
-            auto column = ColumnObject::create({}, max_dynamic_paths, max_dynamic_types);
-            ReadBufferFromString read_buf(serialized_data);
-            column->deserializeAndInsertFromArena(read_buf, nullptr);
+            /// Deserialize value
+            Field value = readFieldBinary(buf);
             
             /// Deserialize sort key
             Field sort_key = readFieldBinary(buf);
             
-            values.emplace_back(ObjectWithKey{std::move(column), sort_key});
+            key_value_map.emplace(key, ValueWithSortKey{value, sort_key});
         }
     }
 
     void insertResultInto(IColumn & to, const DataTypePtr &) const
     {
         auto & result_column = assert_cast<ColumnObject &>(to);
-        
-        if (values.empty())
+
+        if (key_value_map.empty())
         {
             /// Insert default value (empty JSON object)
             result_column.insertDefault();
             return;
         }
 
-        /// Optimization: If only one value, avoid sorting and merging
-        if (values.size() == 1)
+        Object result_object;
+        for (const auto & [key, value_with_key] : key_value_map)
         {
-            result_column.insertFrom(*values[0].object_column, 0);
-            return;
+            if (value_with_key.value.isNull())
+                continue;
+
+            result_object[key] = value_with_key.value;
         }
 
-        /// Sort values by sort key to ensure deterministic order
-        /// Optimization: Use indices instead of cloning columns during sort
-        std::vector<size_t> indices(values.size());
-        std::iota(indices.begin(), indices.end(), 0);
-        ::sort(indices.begin(), indices.end(), [this](size_t a, size_t b) {
-            return values[a].sort_key < values[b].sort_key;
-        });
-
-        /// Merge all JSON objects in sorted order using RFC 7396 JSON Merge Patch semantics
-        /// Optimization: Start with a clone of the first object to avoid unnecessary allocation
-        auto merged_column = values[indices[0]].object_column->cloneResized(1);
-        auto & merged_object = assert_cast<ColumnObject &>(*merged_column);
-        
-        /// Merge subsequent objects using ColumnObject::mergeObjectColumns
-        for (size_t i = 1; i < indices.size(); ++i)
+        try
         {
-            const auto & source_object = assert_cast<const ColumnObject &>(*values[indices[i]].object_column);
-            ColumnObject::mergeObjectColumns(merged_object, source_object, 0, 0);
+            result_column.insert(Field(result_object));
         }
-        
-        /// Insert the merged result
-        result_column.insertFrom(*merged_column, 0);
+        catch (Exception & e)
+        {
+            String sample;
+            size_t count = 0;
+            for (const auto & [key, value_with_key] : key_value_map)
+            {
+                if (count >= 16)
+                    break;
+
+                if (!sample.empty())
+                    sample += ", ";
+
+                sample += key;
+                sample += "=";
+                sample += applyVisitor(FieldVisitorToString(), value_with_key.value);
+                ++count;
+            }
+
+            e.addMessage(fmt::format(
+                "Debug `mergedJSONPatch`: failed to insert finalized JSON object with {} stored paths. Sample paths: {}",
+                key_value_map.size(),
+                sample));
+            throw;
+        }
     }
 };
 
@@ -213,29 +329,29 @@ public:
     void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena * arena) const override
     {
         if (has_sort_key)
-            this->data(place).addWithKey(*columns[0], *columns[1], row_num, arena);
+            data(place).addWithKey(*columns[0], *columns[1], row_num, arena);
         else
-            this->data(place).add(*columns[0], row_num, arena);
+            data(place).add(*columns[0], row_num, arena);
     }
 
     void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena * arena) const override
     {
-        this->data(place).merge(this->data(rhs), arena);
+        data(place).merge(data(rhs), arena);
     }
 
     void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> /* version */) const override
     {
-        this->data(place).serialize(buf);
+        data(place).serialize(buf);
     }
 
     void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /* version */, Arena * arena) const override
     {
-        this->data(place).deserialize(buf, arena);
+        data(place).deserialize(buf, arena);
     }
 
     void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena *) const override
     {
-        this->data(place).insertResultInto(to, result_type);
+        data(place).insertResultInto(to, result_type);
     }
 };
 
@@ -272,17 +388,27 @@ void registerAggregateFunctionMergedJSONPatch(AggregateFunctionFactory & factory
     };
 
     FunctionDocumentation::Description description = R"(
-Aggregates JSON values by merging them using RFC 7396 JSON Merge Patch algorithm.
+Aggregates JSON values by merging them with last-write-wins semantics, implementing the core merge
+behavior of RFC 7396 JSON Merge Patch at the path level.
 
-When called with one argument `mergedJSONPatch(json_col)`, all JSON objects are collected from all shards
-and sorted lexicographically to ensure deterministic order across distributed queries.
+The aggregate function stores state as triplets (key, value, sorting_key) where each key (JSON path)
+only keeps the latest record according to the sorting_key. This enables distributed queries to work
+correctly by merging states at the final stage.
 
-When called with two arguments `mergedJSONPatch(json_col, sort_key)`, JSON objects are sorted by the sort_key
-before merging, allowing explicit control over merge order even in distributed queries.
+When called with one argument `mergedJSONPatch(json_col)`, a deterministic sort key is generated
+from the serialized JSON object to ensure consistent ordering across distributed queries.
 
-All JSON objects are collected from all shards, sorted (by sort_key if provided, otherwise lexicographically),
-and then merged sequentially. Later values in the sorted order overwrite earlier ones for the same keys.
-This ensures consistent results in distributed queries regardless of shard processing order.
+When called with two arguments `mergedJSONPatch(json_col, sort_key)`, the provided sort_key
+determines which value wins for each JSON path. The value with the largest sort_key is retained.
+
+During distributed query execution, each shard maintains a map of (path → (value, sort_key)).
+When merging states from multiple shards, for each path, only the value with the largest sort_key
+is kept. This implements RFC 7396 semantics where later values override earlier ones for the same keys,
+ensuring consistent results regardless of shard processing order.
+
+LIMITATION: RFC 7396 null deletion semantics (where `{"key": null}` removes a key) are not supported.
+ColumnObject silently drops null-valued keys during insertion, making it impossible to distinguish
+between absent keys and keys with null values.
 )";
 
     FunctionDocumentation::Syntax syntax = "mergedJSONPatch(json)";
@@ -298,21 +424,21 @@ This ensures consistent results in distributed queries regardless of shard proce
 
     FunctionDocumentation::Examples examples = {
         {
-            "Basic usage",
+            "Basic usage with sort key",
             R"(
-SELECT mergedJSONPatch(json) FROM 
+SELECT mergedJSONPatch(json, sort_key) FROM
 (
-    SELECT '{"a":1}'::JSON AS json
+    SELECT '{"a":1}'::JSON AS json, 1 AS sort_key
     UNION ALL
-    SELECT '{"b":2}'::JSON
+    SELECT '{"b":2}'::JSON, 2
     UNION ALL
-    SELECT '{"a":3, "c":4}'::JSON
+    SELECT '{"a":3, "c":4}'::JSON, 3
 );
             )",
             R"(
-┌─mergedJSONPatch(json)─┐
-│ {"a":3,"b":2,"c":4}   │
-└───────────────────────┘
+┌─mergedJSONPatch(json, sort_key)─┐
+│ {"a":3,"b":2,"c":4}              │
+└──────────────────────────────────┘
             )"
         }
     };
