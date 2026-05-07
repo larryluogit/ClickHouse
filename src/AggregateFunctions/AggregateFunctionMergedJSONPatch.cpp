@@ -3,14 +3,11 @@
 #include <Common/FieldVisitorToString.h>
 #include <AggregateFunctions/FactoryHelpers.h>
 #include <Columns/ColumnObject.h>
-#include <DataTypes/DataTypeObject.h>
-#include <DataTypes/DataTypeDynamic.h>
 #include <IO/WriteHelpers.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromStringWithMemoryTracking.h>
 #include <Common/Arena.h>
-#include <Common/Exception.h>
 #include <Common/FieldBinaryEncoding.h>
 #include <Core/Field.h>
 
@@ -22,7 +19,6 @@ namespace ErrorCodes
 {
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int LOGICAL_ERROR;
 }
 
 
@@ -162,15 +158,6 @@ struct AggregateFunctionMergedJSONPatchData
             return decodeField(buf);
         }
 
-        bool isNull() const
-        {
-            if (data.size == 0)
-                return true;
-
-            ReadBufferFromString buf(std::string_view(data.data, data.size));
-            return decodeField(buf).isNull();
-        }
-
     };
 
     struct Entry
@@ -217,11 +204,6 @@ struct AggregateFunctionMergedJSONPatchData
         return std::string_view(entry.value.data.data, entry.value.data.size);
     }
 
-    static bool keyLess(std::string_view lhs, std::string_view rhs)
-    {
-        return lhs < rhs;
-    }
-
     static bool isPathPrefix(std::string_view prefix, std::string_view path)
     {
         return path.size() > prefix.size()
@@ -236,7 +218,7 @@ struct AggregateFunctionMergedJSONPatchData
 
         std::sort(entries.begin(), entries.end(), [](const Entry & lhs, const Entry & rhs)
         {
-            return keyLess(getKeyView(lhs), getKeyView(rhs));
+            return getKeyView(lhs) < getKeyView(rhs);
         });
 
         std::vector<Entry> deduplicated;
@@ -337,14 +319,13 @@ struct AggregateFunctionMergedJSONPatchData
         while (!it.end())
         {
             auto path_info = it.getCurrentPathInfo();
-            String key(path_info.path);
 
             /// Get the value for this path
             Field value;
             path_info.column->get(path_info.row, value);
             normalizeMixedJSONArray(value);
 
-            appendPathValue(key, std::move(value), sort_key);
+            appendPathValue(path_info.path, std::move(value), sort_key);
 
             it.next();
         }
@@ -381,7 +362,7 @@ struct AggregateFunctionMergedJSONPatchData
         {
             writeStringBinary(getKeyView(entry), buf);
             writeStringBinary(getValueView(entry), buf);
-            writeFieldBinary(entry.sort_key.toField(), buf);
+            encodeField(entry.sort_key.toField(), buf);
         }
     }
 
@@ -399,7 +380,7 @@ struct AggregateFunctionMergedJSONPatchData
             String value_data;
             readStringBinary(value_data, buf);
 
-            SortKey sort_key = SortKey(readFieldBinary(buf));
+            SortKey sort_key = SortKey(decodeField(buf));
 
             entries.push_back(Entry{
                 .key = copyToArena(path_arena, key),
@@ -442,16 +423,12 @@ class AggregateFunctionMergedJSONPatch final
     : public IAggregateFunctionDataHelper<AggregateFunctionMergedJSONPatchData, AggregateFunctionMergedJSONPatch>
 {
 private:
-    DataTypePtr json_type;
-    DataTypePtr key_type;  /// nullptr if no sort key
     bool has_sort_key;
 
 public:
     explicit AggregateFunctionMergedJSONPatch(const DataTypes & argument_types_)
         : IAggregateFunctionDataHelper<AggregateFunctionMergedJSONPatchData, AggregateFunctionMergedJSONPatch>(
             argument_types_, {}, argument_types_[0])
-        , json_type(argument_types_[0])
-        , key_type(argument_types_.size() > 1 ? argument_types_[1] : nullptr)
         , has_sort_key(argument_types_.size() > 1)
     {
     }
