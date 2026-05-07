@@ -365,5 +365,88 @@ TEST(AggregateFunctionMergedJSONPatch, MixedScalarAndObjectArrayElementsAreSanit
     func->destroy(place);
 }
 
+TEST(AggregateFunctionMergedJSONPatch, SerializedStatePreservesConflictResolutionOnMergeAndDeserialize)
+{
+    tryRegisterAggregateFunctions();
+
+    auto func = createMergedJSONPatchFunction(true);
+
+    PODArray<char> place1_buffer;
+    PODArray<char> place2_buffer;
+    PODArray<char> place3_buffer;
+    place1_buffer.resize(func->sizeOfData());
+    place2_buffer.resize(func->sizeOfData());
+    place3_buffer.resize(func->sizeOfData());
+
+    AggregateDataPtr place1 = place1_buffer.data();
+    AggregateDataPtr place2 = place2_buffer.data();
+    AggregateDataPtr place3 = place3_buffer.data();
+    func->create(place1);
+    func->create(place2);
+    func->create(place3);
+
+    Arena arena;
+
+    {
+        auto json_column = ColumnObject::create({}, 1024, 255);
+        auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+        auto sort_key_column = DataTypeInt64().createColumn();
+
+        obj_col.insert(Field(createObject({
+            {"a.nested", Field(Int64(1))},
+            {"caps", Array{Field("alpha"), Field("beta")}}
+        })));
+        sort_key_column->insert(Field(Int64(1)));
+
+        const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+        func->add(place1, columns, 0, &arena);
+    }
+
+    {
+        auto json_column = ColumnObject::create({}, 1024, 255);
+        auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+        auto sort_key_column = DataTypeInt64().createColumn();
+
+        obj_col.insert(Field(createObject({
+            {"a", Field("plain text")},
+            {"caps", Array{Field("newer")}},
+            {"name", Field("agent-x")}
+        })));
+        sort_key_column->insert(Field(Int64(2)));
+
+        const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+        func->add(place2, columns, 0, &arena);
+    }
+
+    WriteBufferFromOwnString write_buf;
+    func->serialize(place2, write_buf, std::nullopt);
+    ReadBufferFromString read_buf(write_buf.str());
+    func->deserialize(place3, read_buf, std::nullopt, &arena);
+
+    func->merge(place1, place3, &arena);
+
+    auto result_column = func->getResultType()->createColumn();
+    func->insertResultInto(place1, *result_column, &arena);
+
+    Field result_field;
+    result_column->get(0, result_field);
+    const auto & result_obj = result_field.safeGet<Object>();
+
+    ASSERT_TRUE(result_obj.contains("a"));
+    EXPECT_EQ(result_obj.at("a").safeGet<String>(), "plain text");
+    EXPECT_FALSE(result_obj.contains("a.nested"));
+    ASSERT_TRUE(result_obj.contains("caps"));
+    ASSERT_TRUE(result_obj.contains("name"));
+    EXPECT_EQ(result_obj.at("name").safeGet<String>(), "agent-x");
+
+    const auto & caps = result_obj.at("caps").safeGet<Array>();
+    ASSERT_EQ(caps.size(), 1);
+    EXPECT_EQ(caps[0].safeGet<String>(), "newer");
+
+    func->destroy(place1);
+    func->destroy(place2);
+    func->destroy(place3);
+}
+
 
 
