@@ -448,5 +448,150 @@ TEST(AggregateFunctionMergedJSONPatch, SerializedStatePreservesConflictResolutio
     func->destroy(place3);
 }
 
+TEST(AggregateFunctionMergedJSONPatch, RepeatedSamePathUpdatesDoNotAccumulateState)
+{
+    tryRegisterAggregateFunctions();
+
+    auto func = createMergedJSONPatchFunction(true);
+
+    PODArray<char> place_buffer;
+    place_buffer.resize(func->sizeOfData());
+    AggregateDataPtr place = place_buffer.data();
+    func->create(place);
+
+    Arena arena;
+    auto json_column = ColumnObject::create({}, 1024, 255);
+    auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+    auto sort_key_column = DataTypeInt64().createColumn();
+
+    for (Int64 i = 0; i < 64; ++i)
+    {
+        obj_col.insert(Field(createObject({
+            {"a", Field(i)},
+            {"name", Field("stable")}
+        })));
+        sort_key_column->insert(Field(i));
+    }
+
+    const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+    for (size_t i = 0; i < 64; ++i)
+        func->add(place, columns, i, &arena);
+
+    WriteBufferFromOwnString write_buf;
+    func->serialize(place, write_buf, std::nullopt);
+
+    auto result_column = func->getResultType()->createColumn();
+    func->insertResultInto(place, *result_column, &arena);
+
+    Field result_field;
+    result_column->get(0, result_field);
+    const auto & result_obj = result_field.safeGet<Object>();
+
+    EXPECT_EQ(getInt64FromObject(result_obj, "a"), 63);
+    EXPECT_EQ(getStringFromObject(result_obj, "name"), "stable");
+
+    ReadBufferFromString read_buf(write_buf.str());
+    size_t serialized_entries = 0;
+    readVarUInt(serialized_entries, read_buf);
+    EXPECT_EQ(serialized_entries, 2);
+
+    func->destroy(place);
+}
+
+TEST(AggregateFunctionMergedJSONPatch, MergeOfCompactedStatesKeepsOnlyWinningEntries)
+{
+    tryRegisterAggregateFunctions();
+
+    auto func = createMergedJSONPatchFunction(true);
+
+    PODArray<char> left_buffer;
+    PODArray<char> right_buffer;
+    left_buffer.resize(func->sizeOfData());
+    right_buffer.resize(func->sizeOfData());
+    AggregateDataPtr left = left_buffer.data();
+    AggregateDataPtr right = right_buffer.data();
+    func->create(left);
+    func->create(right);
+
+    Arena arena;
+
+    {
+        auto json_column = ColumnObject::create({}, 1024, 255);
+        auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+        auto sort_key_column = DataTypeInt64().createColumn();
+
+        obj_col.insert(Field(createObject({
+            {"root.child", Field(Int64(1))},
+            {"keep", Field("left")}
+        })));
+        sort_key_column->insert(Field(Int64(1)));
+
+        obj_col.insert(Field(createObject({
+            {"root.child", Field(Int64(2))},
+            {"keep", Field("left-new")}
+        })));
+        sort_key_column->insert(Field(Int64(2)));
+
+        const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+        func->add(left, columns, 0, &arena);
+        func->add(left, columns, 1, &arena);
+    }
+
+    {
+        auto json_column = ColumnObject::create({}, 1024, 255);
+        auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+        auto sort_key_column = DataTypeInt64().createColumn();
+
+        obj_col.insert(Field(createObject({
+            {"root", Field("winner")},
+            {"other", Field("value")}
+        })));
+        sort_key_column->insert(Field(Int64(3)));
+
+        const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+        func->add(right, columns, 0, &arena);
+    }
+
+    WriteBufferFromOwnString left_buf;
+    WriteBufferFromOwnString right_buf;
+    func->serialize(left, left_buf, std::nullopt);
+    func->serialize(right, right_buf, std::nullopt);
+
+    func->merge(left, right, &arena);
+
+    auto result_column = func->getResultType()->createColumn();
+    func->insertResultInto(left, *result_column, &arena);
+
+    Field result_field;
+    result_column->get(0, result_field);
+    const auto & result_obj = result_field.safeGet<Object>();
+
+    ASSERT_TRUE(result_obj.contains("root"));
+    EXPECT_EQ(result_obj.at("root").safeGet<String>(), "winner");
+    EXPECT_FALSE(result_obj.contains("root.child"));
+    EXPECT_EQ(getStringFromObject(result_obj, "keep"), "left-new");
+    EXPECT_EQ(getStringFromObject(result_obj, "other"), "value");
+
+    ReadBufferFromString read_left(left_buf.str());
+    ReadBufferFromString read_right(right_buf.str());
+    size_t left_entries = 0;
+    size_t right_entries = 0;
+    readVarUInt(left_entries, read_left);
+    readVarUInt(right_entries, read_right);
+
+    EXPECT_EQ(left_entries, 2);
+    EXPECT_EQ(right_entries, 2);
+
+    WriteBufferFromOwnString merged_buf;
+    func->serialize(left, merged_buf, std::nullopt);
+    ReadBufferFromString merged_read(merged_buf.str());
+    size_t merged_entries = 0;
+    readVarUInt(merged_entries, merged_read);
+    EXPECT_EQ(merged_entries, 3);
+
+    func->destroy(left);
+    func->destroy(right);
+}
+
 
 

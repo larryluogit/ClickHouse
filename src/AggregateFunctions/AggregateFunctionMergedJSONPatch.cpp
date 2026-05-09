@@ -188,6 +188,8 @@ struct AggregateFunctionMergedJSONPatchData
         return EncodedField{copyToArena(value_arena, buf.str())};
     }
 
+    static constexpr size_t COMPACTION_THRESHOLD = 4096;
+
     void ensureCompacted() const
     {
         if (!is_compacted)
@@ -304,12 +306,51 @@ struct AggregateFunctionMergedJSONPatchData
 
     void appendPathValue(std::string_view key, Field value, const SortKey & sort_key)
     {
+        if (!is_compacted)
+        {
+            for (auto & entry : entries)
+            {
+                std::string_view existing_key = getKeyView(entry);
+
+                if (existing_key == key)
+                {
+                    if (entry.sort_key <= sort_key)
+                    {
+                        entry.key = copyToArena(path_arena, key);
+                        entry.value = encodeFieldToArena(std::move(value));
+                        entry.sort_key = sort_key;
+                    }
+                    return;
+                }
+
+                if (isPathPrefix(key, existing_key))
+                {
+                    if (entry.sort_key <= sort_key)
+                    {
+                        entry.key = copyToArena(path_arena, key);
+                        entry.value = encodeFieldToArena(std::move(value));
+                        entry.sort_key = sort_key;
+                    }
+                    return;
+                }
+
+                if (isPathPrefix(existing_key, key))
+                {
+                    if (entry.sort_key > sort_key)
+                        return;
+                }
+            }
+        }
+
         entries.push_back(Entry{
             .key = copyToArena(path_arena, key),
             .value = encodeFieldToArena(std::move(value)),
             .sort_key = sort_key
         });
         is_compacted = false;
+
+        if (entries.size() >= COMPACTION_THRESHOLD)
+            compactEntries();
     }
 
     void addKeyValuePairs(const ColumnObject & object_column, size_t row_num, const SortKey & sort_key)
@@ -340,16 +381,85 @@ struct AggregateFunctionMergedJSONPatchData
         ensureCompacted();
         other.ensureCompacted();
 
-        entries.reserve(entries.size() + other.entries.size());
-        for (const auto & entry : other.entries)
+        std::vector<Entry> merged;
+        merged.reserve(entries.size() + other.entries.size());
+
+        size_t lhs = 0;
+        size_t rhs = 0;
+
+        while (lhs < entries.size() || rhs < other.entries.size())
         {
-            entries.push_back(Entry{
-                .key = copyToArena(path_arena, getKeyView(entry)),
-                .value = EncodedField{copyToArena(value_arena, getValueView(entry))},
-                .sort_key = entry.sort_key
-            });
+            const Entry * candidate = nullptr;
+
+            if (rhs >= other.entries.size())
+            {
+                candidate = &entries[lhs++];
+            }
+            else if (lhs >= entries.size())
+            {
+                candidate = &other.entries[rhs++];
+            }
+            else
+            {
+                std::string_view lhs_key = getKeyView(entries[lhs]);
+                std::string_view rhs_key = getKeyView(other.entries[rhs]);
+
+                if (lhs_key < rhs_key)
+                    candidate = &entries[lhs++];
+                else
+                    candidate = &other.entries[rhs++];
+            }
+
+            std::string_view candidate_key = getKeyView(*candidate);
+            bool skip = false;
+
+            for (auto it = merged.begin(); it != merged.end();)
+            {
+                std::string_view existing_key = getKeyView(*it);
+                if (existing_key == candidate_key)
+                {
+                    if (it->sort_key <= candidate->sort_key)
+                    {
+                        *it = Entry{
+                            .key = copyToArena(path_arena, candidate_key),
+                            .value = EncodedField{copyToArena(value_arena, getValueView(*candidate))},
+                            .sort_key = candidate->sort_key
+                        };
+                    }
+                    skip = true;
+                    break;
+                }
+
+                if (isPathPrefix(candidate_key, existing_key) || isPathPrefix(existing_key, candidate_key))
+                {
+                    if (it->sort_key <= candidate->sort_key)
+                    {
+                        it = merged.erase(it);
+                    }
+                    else
+                    {
+                        skip = true;
+                        break;
+                    }
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+
+            if (!skip)
+            {
+                merged.push_back(Entry{
+                    .key = copyToArena(path_arena, candidate_key),
+                    .value = EncodedField{copyToArena(value_arena, getValueView(*candidate))},
+                    .sort_key = candidate->sort_key
+                });
+            }
         }
-        is_compacted = false;
+
+        entries = std::move(merged);
+        is_compacted = true;
     }
 
     void serialize(WriteBuffer & buf) const
@@ -382,14 +492,9 @@ struct AggregateFunctionMergedJSONPatchData
 
             SortKey sort_key = SortKey(decodeField(buf));
 
-            entries.push_back(Entry{
-                .key = copyToArena(path_arena, key),
-                .value = EncodedField{copyToArena(value_arena, value_data)},
-                .sort_key = std::move(sort_key)
-            });
+            ReadBufferFromString value_buf(value_data);
+            appendPathValue(key, decodeField(value_buf), sort_key);
         }
-
-        is_compacted = false;
     }
 
     void insertResultInto(IColumn & to, const DataTypePtr &) const
