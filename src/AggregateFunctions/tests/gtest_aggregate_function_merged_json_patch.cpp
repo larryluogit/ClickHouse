@@ -5,6 +5,7 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
 #include <Common/Arena.h>
 #include <Common/tests/gtest_global_register.h>
 #include <base/defines.h>
@@ -491,9 +492,13 @@ TEST(AggregateFunctionMergedJSONPatch, RepeatedSamePathUpdatesDoNotAccumulateSta
     EXPECT_EQ(getStringFromObject(result_obj, "name"), "stable");
 
     ReadBufferFromString read_buf(write_buf.str());
-    size_t serialized_entries = 0;
-    readVarUInt(serialized_entries, read_buf);
-    EXPECT_EQ(serialized_entries, 2);
+    bool has_terminal = false;
+    readBoolText(has_terminal, read_buf);
+    EXPECT_FALSE(has_terminal);
+
+    size_t root_children = 0;
+    readVarUInt(root_children, read_buf);
+    EXPECT_EQ(root_children, 2);
 
     func->destroy(place);
 }
@@ -574,23 +579,91 @@ TEST(AggregateFunctionMergedJSONPatch, MergeOfCompactedStatesKeepsOnlyWinningEnt
 
     ReadBufferFromString read_left(left_buf.str());
     ReadBufferFromString read_right(right_buf.str());
-    size_t left_entries = 0;
-    size_t right_entries = 0;
-    readVarUInt(left_entries, read_left);
-    readVarUInt(right_entries, read_right);
 
-    EXPECT_EQ(left_entries, 2);
-    EXPECT_EQ(right_entries, 2);
+    bool left_has_terminal = false;
+    bool right_has_terminal = false;
+    readBoolText(left_has_terminal, read_left);
+    readBoolText(right_has_terminal, read_right);
+    EXPECT_FALSE(left_has_terminal);
+    EXPECT_FALSE(right_has_terminal);
+
+    size_t left_children = 0;
+    size_t right_children = 0;
+    readVarUInt(left_children, read_left);
+    readVarUInt(right_children, read_right);
+
+    EXPECT_EQ(left_children, 2);
+    EXPECT_EQ(right_children, 2);
 
     WriteBufferFromOwnString merged_buf;
     func->serialize(left, merged_buf, std::nullopt);
     ReadBufferFromString merged_read(merged_buf.str());
-    size_t merged_entries = 0;
-    readVarUInt(merged_entries, merged_read);
-    EXPECT_EQ(merged_entries, 3);
+
+    bool merged_has_terminal = false;
+    readBoolText(merged_has_terminal, merged_read);
+    EXPECT_FALSE(merged_has_terminal);
+
+    size_t merged_children = 0;
+    readVarUInt(merged_children, merged_read);
+    EXPECT_EQ(merged_children, 3);
 
     func->destroy(left);
     func->destroy(right);
+}
+
+TEST(AggregateFunctionMergedJSONPatch, WideSubtreeSerializesAsNestedTree)
+{
+    tryRegisterAggregateFunctions();
+
+    auto func = createMergedJSONPatchFunction(true);
+
+    PODArray<char> place_buffer;
+    place_buffer.resize(func->sizeOfData());
+    AggregateDataPtr place = place_buffer.data();
+    func->create(place);
+
+    Arena arena;
+    auto json_column = ColumnObject::create({}, 1024, 255);
+    auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+    auto sort_key_column = DataTypeInt64().createColumn();
+
+    obj_col.insert(Field(createObject({
+        {"data.runtime.nodejs.dependencies.react", Field("18.0.0")},
+        {"data.runtime.nodejs.dependencies.vue", Field("3.0.0")},
+        {"data.runtime.nodejs.dependencies.lodash", Field("4.17.21")},
+        {"data.runtime.nodejs.name", Field("node-service")}
+    })));
+    sort_key_column->insert(Field(Int64(1)));
+
+    const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+    func->add(place, columns, 0, &arena);
+
+    WriteBufferFromOwnString write_buf;
+    func->serialize(place, write_buf, std::nullopt);
+
+    ReadBufferFromString read_buf(write_buf.str());
+
+    bool root_has_terminal = false;
+    readBoolText(root_has_terminal, read_buf);
+    EXPECT_FALSE(root_has_terminal);
+
+    size_t root_children = 0;
+    readVarUInt(root_children, read_buf);
+    EXPECT_EQ(root_children, 1);
+
+    String root_child_name;
+    readStringBinary(root_child_name, read_buf);
+    EXPECT_EQ(root_child_name, "data");
+
+    bool data_has_terminal = false;
+    readBoolText(data_has_terminal, read_buf);
+    EXPECT_FALSE(data_has_terminal);
+
+    size_t data_children = 0;
+    readVarUInt(data_children, read_buf);
+    EXPECT_EQ(data_children, 1);
+
+    func->destroy(place);
 }
 
 

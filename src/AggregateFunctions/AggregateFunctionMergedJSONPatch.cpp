@@ -62,17 +62,15 @@ struct AggregateFunctionMergedJSONPatchData
         }
     }
 
-    /// Store triplets: (key, value, sorting_key)
-    /// Each key only keeps the latest record according to sorting_key.
-    /// This implements last-write-wins semantics at the path level, which is the core merge
-    /// behavior of RFC 7396 JSON Merge Patch, and enables distributed queries to work correctly
-    /// by merging states at the final stage.
+    /// Store a hierarchical patch tree with per-node winner metadata instead of a flat list
+    /// of dotted paths. This removes repeated long prefixes for wide objects such as Node.js
+    /// dependency maps while preserving recursive RFC 7396 object merge semantics.
     ///
     /// LIMITATION: RFC 7396 null deletion semantics (where `{"key": null}` removes a key) are NOT supported.
-    /// When a JSON object like `{"key": null}` is inserted into ColumnObject, the null-valued
-    /// key is silently dropped (see ColumnObject::insert() lines 495-504). ColumnObject
-    /// cannot distinguish between "key is absent" and "key has null value", treating them
-    /// as equivalent. Therefore, this aggregate function cannot detect or handle null deletion.
+    /// When a JSON object like `{"key": null}` is inserted into `ColumnObject`, the null-valued
+    /// key is silently dropped. `ColumnObject` cannot distinguish between "key is absent" and
+    /// "key has null value", treating them as equivalent. Therefore, this aggregate function
+    /// cannot detect or handle null deletion.
     struct SortKey
     {
         Field value;
@@ -139,6 +137,11 @@ struct AggregateFunctionMergedJSONPatchData
             : data(data_), size(size_)
         {
         }
+
+        std::string_view view() const
+        {
+            return std::string_view(data, size);
+        }
     };
 
     struct EncodedField
@@ -154,28 +157,29 @@ struct AggregateFunctionMergedJSONPatchData
 
         Field get() const
         {
-            ReadBufferFromString buf(std::string_view(data.data, data.size));
+            ReadBufferFromString buf(data.view());
             return decodeField(buf);
         }
-
     };
 
-    struct Entry
+    struct Node
     {
-        StringSlice key;
-        EncodedField value;
-        SortKey sort_key;
+        std::map<String, Node> children;
+        std::optional<EncodedField> terminal_value;
+        std::optional<SortKey> terminal_sort_key;
     };
 
-    Arena path_arena;
+    Arena string_arena;
     Arena value_arena;
-    std::vector<Entry> entries;
-    mutable bool is_compacted = true;
+    Node root;
 
     AggregateFunctionMergedJSONPatchData() = default;
 
     static StringSlice copyToArena(Arena & arena, std::string_view data)
     {
+        if (data.empty())
+            return {};
+
         char * dst = arena.alloc(data.size());
         memcpy(dst, data.data(), data.size());
         return StringSlice(dst, data.size());
@@ -185,338 +189,277 @@ struct AggregateFunctionMergedJSONPatchData
     {
         WriteBufferFromOwnString buf;
         encodeField(value, buf);
-        return EncodedField{copyToArena(value_arena, buf.str())};
+        return EncodedField(copyToArena(value_arena, buf.str()));
     }
 
-    static constexpr size_t COMPACTION_THRESHOLD = 4096;
-
-    void ensureCompacted() const
+    static bool isObjectField(const Field & value)
     {
-        if (!is_compacted)
-            const_cast<AggregateFunctionMergedJSONPatchData *>(this)->compactEntries();
+        return value.getType() == Field::Types::Object;
     }
 
-    static std::string_view getKeyView(const Entry & entry)
+    static void splitPath(std::string_view path, std::vector<std::string_view> & parts)
     {
-        return std::string_view(entry.key.data, entry.key.size);
+        parts.clear();
+
+        size_t start = 0;
+        while (start <= path.size())
+        {
+            size_t dot = path.find('.', start);
+            if (dot == std::string_view::npos)
+            {
+                parts.emplace_back(path.substr(start));
+                break;
+            }
+
+            parts.emplace_back(path.substr(start, dot - start));
+            start = dot + 1;
+        }
     }
 
-    static std::string_view getValueView(const Entry & entry)
+    static void buildFieldFromNode(const Node & node, Field & out)
     {
-        return std::string_view(entry.value.data.data, entry.value.data.size);
+        if (node.terminal_value)
+        {
+            out = node.terminal_value->get();
+            return;
+        }
+
+        Object object;
+        for (const auto & [name, child] : node.children)
+        {
+            Field child_value;
+            buildFieldFromNode(child, child_value);
+            if (!child_value.isNull())
+                object[name] = std::move(child_value);
+        }
+
+        out = Field(std::move(object));
     }
 
-    static bool isPathPrefix(std::string_view prefix, std::string_view path)
+    static void mergeObjectIntoNode(Node & node, const Object & object, const SortKey & sort_key, AggregateFunctionMergedJSONPatchData & owner)
     {
-        return path.size() > prefix.size()
-            && path.starts_with(prefix)
-            && path[prefix.size()] == '.';
-    }
-
-    void compactEntries()
-    {
-        if (is_compacted)
+        if (node.terminal_sort_key && *node.terminal_sort_key > sort_key)
             return;
 
-        std::sort(entries.begin(), entries.end(), [](const Entry & lhs, const Entry & rhs)
-        {
-            return getKeyView(lhs) < getKeyView(rhs);
-        });
+        node.terminal_value.reset();
+        node.terminal_sort_key.reset();
 
-        std::vector<Entry> deduplicated;
-        deduplicated.reserve(entries.size());
+        for (const auto & [key, value] : object)
+            owner.insertPathValue(node, key, value, sort_key);
+    }
 
-        for (const auto & entry : entries)
+    void insertField(Node & node, Field value, const SortKey & sort_key)
+    {
+        normalizeMixedJSONArray(value);
+
+        if (!isObjectField(value))
         {
-            if (!deduplicated.empty() && getKeyView(deduplicated.back()) == getKeyView(entry))
+            node.children.clear();
+            node.terminal_value = encodeFieldToArena(std::move(value));
+            node.terminal_sort_key = sort_key;
+            return;
+        }
+
+        if (node.terminal_sort_key && *node.terminal_sort_key > sort_key)
+            return;
+
+        node.terminal_value.reset();
+        node.terminal_sort_key.reset();
+
+        const auto & object = value.safeGet<Object>();
+        for (const auto & [child_key, child_value] : object)
+            insertPathValue(node, child_key, child_value, sort_key);
+    }
+
+    void insertPathValue(Node & start_node, std::string_view path, Field value, const SortKey & sort_key)
+    {
+        std::vector<std::string_view> parts;
+        splitPath(path, parts);
+
+        Node * current = &start_node;
+        for (size_t i = 0; i < parts.size(); ++i)
+        {
+            if (current->terminal_sort_key && *current->terminal_sort_key > sort_key)
+                return;
+
+            bool is_last = (i + 1 == parts.size());
+            auto [it, inserted] = current->children.try_emplace(String(parts[i]), Node{});
+            current = &it->second;
+
+            if (is_last)
+                insertField(*current, std::move(value), sort_key);
+        }
+    }
+
+    void insertPathValue(std::string_view path, Field value, const SortKey & sort_key)
+    {
+        insertPathValue(root, path, std::move(value), sort_key);
+    }
+
+    static void mergeNode(Node & dst, const Node & src, AggregateFunctionMergedJSONPatchData & owner)
+    {
+        if (src.terminal_value && src.terminal_sort_key)
+        {
+            Field src_value = src.terminal_value->get();
+            if (!isObjectField(src_value))
             {
-                if (deduplicated.back().sort_key <= entry.sort_key)
+                if (!dst.terminal_sort_key || *dst.terminal_sort_key <= *src.terminal_sort_key)
                 {
-                    deduplicated.back().key = entry.key;
-                    deduplicated.back().value = entry.value;
-                    deduplicated.back().sort_key = entry.sort_key;
+                    dst.children.clear();
+                    dst.terminal_value = owner.encodeFieldToArena(std::move(src_value));
+                    dst.terminal_sort_key = *src.terminal_sort_key;
                 }
+                return;
             }
-            else
+
+            if (!dst.terminal_sort_key || *dst.terminal_sort_key <= *src.terminal_sort_key)
+                mergeObjectIntoNode(dst, src_value.safeGet<Object>(), *src.terminal_sort_key, owner);
+        }
+
+        if (dst.terminal_value && dst.terminal_sort_key)
+        {
+            Field dst_value = dst.terminal_value->get();
+            if (!isObjectField(dst_value))
+                return;
+
+            if (src.terminal_sort_key && *src.terminal_sort_key > *dst.terminal_sort_key)
             {
-                deduplicated.push_back(entry);
+                dst.terminal_value.reset();
+                dst.terminal_sort_key.reset();
             }
         }
 
-        std::vector<Entry> compacted;
-        compacted.reserve(deduplicated.size());
-
-        for (const auto & entry : deduplicated)
+        for (const auto & [name, src_child] : src.children)
         {
-            std::string_view key = getKeyView(entry);
-            bool skip = false;
+            auto [it, inserted] = dst.children.try_emplace(name, Node{});
+            mergeNode(it->second, src_child, owner);
+        }
+    }
 
-            for (auto it = compacted.begin(); it != compacted.end();)
-            {
-                std::string_view existing_key = getKeyView(*it);
-                if (isPathPrefix(key, existing_key) || isPathPrefix(existing_key, key))
-                {
-                    if (it->sort_key <= entry.sort_key)
-                    {
-                        it = compacted.erase(it);
-                    }
-                    else
-                    {
-                        skip = true;
-                        break;
-                    }
-                }
-                else
-                {
-                    ++it;
-                }
-            }
-
-            if (!skip)
-                compacted.push_back(entry);
+    static void serializeNode(const Node & node, WriteBuffer & buf)
+    {
+        writeBoolText(node.terminal_value.has_value(), buf);
+        if (node.terminal_value)
+        {
+            writeStringBinary(node.terminal_value->data.view(), buf);
+            encodeField(node.terminal_sort_key->toField(), buf);
         }
 
-        entries = std::move(compacted);
-        is_compacted = true;
+        writeVarUInt(node.children.size(), buf);
+        for (const auto & [name, child] : node.children)
+        {
+            writeStringBinary(name, buf);
+            serializeNode(child, buf);
+        }
+    }
+
+    void deserializeNode(Node & node, ReadBuffer & buf)
+    {
+        bool has_terminal = false;
+        readBoolText(has_terminal, buf);
+        if (has_terminal)
+        {
+            String value_data;
+            readStringBinary(value_data, buf);
+            node.terminal_value = EncodedField(copyToArena(value_arena, value_data));
+            node.terminal_sort_key = SortKey(decodeField(buf));
+        }
+
+        size_t children_size = 0;
+        readVarUInt(children_size, buf);
+        for (size_t i = 0; i < children_size; ++i)
+        {
+            String key;
+            readStringBinary(key, buf);
+            auto [it, inserted] = node.children.try_emplace(key, Node{});
+            deserializeNode(it->second, buf);
+        }
+    }
+
+    static void collectObject(const Node & node, Object & out)
+    {
+        if (node.terminal_value)
+        {
+            Field value = node.terminal_value->get();
+            if (isObjectField(value))
+            {
+                const auto & object = value.safeGet<Object>();
+                for (const auto & [key, child_value] : object)
+                    out[key] = child_value;
+            }
+            return;
+        }
+
+        for (const auto & [name, child] : node.children)
+        {
+            Field child_value;
+            buildFieldFromNode(child, child_value);
+            if (!child_value.isNull())
+                out[name] = std::move(child_value);
+        }
     }
 
     void add(const IColumn & json_column, size_t row_num, Arena * arena)
     {
         const auto & object_column = assert_cast<const ColumnObject &>(json_column);
-        
-        /// Use a serialized representation of the object as sort key for deterministic ordering
+
         const char * begin = nullptr;
         auto serialized = object_column.serializeValueIntoArena(row_num, *arena, begin, nullptr);
         SortKey sort_key = SortKey(Field(String(serialized)));
-        
-        /// Extract all key-value pairs from the JSON object
+
         addKeyValuePairs(object_column, row_num, sort_key);
     }
 
     void addWithKey(const IColumn & json_column, const IColumn & key_column, size_t row_num, Arena *)
     {
         const auto & object_column = assert_cast<const ColumnObject &>(json_column);
-        
-        /// Get sort key
         SortKey sort_key = SortKey(key_column[row_num]);
-        
-        /// Extract all key-value pairs from the JSON object
         addKeyValuePairs(object_column, row_num, sort_key);
-    }
-
-    void appendPathValue(std::string_view key, Field value, const SortKey & sort_key)
-    {
-        if (!is_compacted)
-        {
-            for (auto & entry : entries)
-            {
-                std::string_view existing_key = getKeyView(entry);
-
-                if (existing_key == key)
-                {
-                    if (entry.sort_key <= sort_key)
-                    {
-                        entry.key = copyToArena(path_arena, key);
-                        entry.value = encodeFieldToArena(std::move(value));
-                        entry.sort_key = sort_key;
-                    }
-                    return;
-                }
-
-                if (isPathPrefix(key, existing_key))
-                {
-                    if (entry.sort_key <= sort_key)
-                    {
-                        entry.key = copyToArena(path_arena, key);
-                        entry.value = encodeFieldToArena(std::move(value));
-                        entry.sort_key = sort_key;
-                    }
-                    return;
-                }
-
-                if (isPathPrefix(existing_key, key))
-                {
-                    if (entry.sort_key > sort_key)
-                        return;
-                }
-            }
-        }
-
-        entries.push_back(Entry{
-            .key = copyToArena(path_arena, key),
-            .value = encodeFieldToArena(std::move(value)),
-            .sort_key = sort_key
-        });
-        is_compacted = false;
-
-        if (entries.size() >= COMPACTION_THRESHOLD)
-            compactEntries();
     }
 
     void addKeyValuePairs(const ColumnObject & object_column, size_t row_num, const SortKey & sort_key)
     {
-        /// Use SortedPathsIterator to iterate over all paths (typed + dynamic + shared data)
         ColumnObject::SortedPathsIterator it(object_column, row_num);
         while (!it.end())
         {
             auto path_info = it.getCurrentPathInfo();
 
-            /// Get the value for this path
             Field value;
             path_info.column->get(path_info.row, value);
             normalizeMixedJSONArray(value);
 
-            appendPathValue(path_info.path, std::move(value), sort_key);
-
+            insertPathValue(path_info.path, std::move(value), sort_key);
             it.next();
         }
     }
 
     void merge(const AggregateFunctionMergedJSONPatchData & other, Arena *)
     {
-        /// Merge key-value pairs from other state, keeping only the latest for each key.
-        /// This implements last-write-wins semantics (RFC 7396 core behavior): for each path,
-        /// the value with the largest sorting_key wins, which is equivalent to merging objects
-        /// in sorted order. Note: RFC 7396 null deletion is not supported (see limitation above).
-        ensureCompacted();
-        other.ensureCompacted();
-
-        std::vector<Entry> merged;
-        merged.reserve(entries.size() + other.entries.size());
-
-        size_t lhs = 0;
-        size_t rhs = 0;
-
-        while (lhs < entries.size() || rhs < other.entries.size())
-        {
-            const Entry * candidate = nullptr;
-
-            if (rhs >= other.entries.size())
-            {
-                candidate = &entries[lhs++];
-            }
-            else if (lhs >= entries.size())
-            {
-                candidate = &other.entries[rhs++];
-            }
-            else
-            {
-                std::string_view lhs_key = getKeyView(entries[lhs]);
-                std::string_view rhs_key = getKeyView(other.entries[rhs]);
-
-                if (lhs_key < rhs_key)
-                    candidate = &entries[lhs++];
-                else
-                    candidate = &other.entries[rhs++];
-            }
-
-            std::string_view candidate_key = getKeyView(*candidate);
-            bool skip = false;
-
-            for (auto it = merged.begin(); it != merged.end();)
-            {
-                std::string_view existing_key = getKeyView(*it);
-                if (existing_key == candidate_key)
-                {
-                    if (it->sort_key <= candidate->sort_key)
-                    {
-                        *it = Entry{
-                            .key = copyToArena(path_arena, candidate_key),
-                            .value = EncodedField{copyToArena(value_arena, getValueView(*candidate))},
-                            .sort_key = candidate->sort_key
-                        };
-                    }
-                    skip = true;
-                    break;
-                }
-
-                if (isPathPrefix(candidate_key, existing_key) || isPathPrefix(existing_key, candidate_key))
-                {
-                    if (it->sort_key <= candidate->sort_key)
-                    {
-                        it = merged.erase(it);
-                    }
-                    else
-                    {
-                        skip = true;
-                        break;
-                    }
-                }
-                else
-                {
-                    ++it;
-                }
-            }
-
-            if (!skip)
-            {
-                merged.push_back(Entry{
-                    .key = copyToArena(path_arena, candidate_key),
-                    .value = EncodedField{copyToArena(value_arena, getValueView(*candidate))},
-                    .sort_key = candidate->sort_key
-                });
-            }
-        }
-
-        entries = std::move(merged);
-        is_compacted = true;
+        mergeNode(root, other.root, *this);
     }
 
     void serialize(WriteBuffer & buf) const
     {
-        ensureCompacted();
-
-        writeVarUInt(entries.size(), buf);
-
-        for (const auto & entry : entries)
-        {
-            writeStringBinary(getKeyView(entry), buf);
-            writeStringBinary(getValueView(entry), buf);
-            encodeField(entry.sort_key.toField(), buf);
-        }
+        serializeNode(root, buf);
     }
 
     void deserialize(ReadBuffer & buf, Arena *)
     {
-        size_t size = 0;
-        readVarUInt(size, buf);
-        entries.reserve(entries.size() + size);
-
-        for (size_t i = 0; i < size; ++i)
-        {
-            String key;
-            readStringBinary(key, buf);
-
-            String value_data;
-            readStringBinary(value_data, buf);
-
-            SortKey sort_key = SortKey(decodeField(buf));
-
-            ReadBufferFromString value_buf(value_data);
-            appendPathValue(key, decodeField(value_buf), sort_key);
-        }
+        root = Node{};
+        deserializeNode(root, buf);
     }
 
     void insertResultInto(IColumn & to, const DataTypePtr &) const
     {
         auto & result_column = assert_cast<ColumnObject &>(to);
 
-        ensureCompacted();
+        Object result_object;
+        collectObject(root, result_object);
 
-        if (entries.empty())
+        if (result_object.empty())
         {
             result_column.insertDefault();
             return;
-        }
-
-        Object result_object;
-        for (const auto & entry : entries)
-        {
-            Field value = entry.value.get();
-            if (value.isNull())
-                continue;
-
-            result_object[String(entry.key.data, entry.key.size)] = std::move(value);
         }
 
         result_column.insert(Field(result_object));
