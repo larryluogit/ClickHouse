@@ -297,6 +297,56 @@ struct AggregateFunctionMergedJSONPatchData
         }
     };
 
+    struct InternedSegmentKey
+    {
+        std::string_view value;
+
+        bool operator==(const InternedSegmentKey & other) const = default;
+    };
+
+    struct InternedSegmentKeyHash
+    {
+        size_t operator()(const InternedSegmentKey & key) const
+        {
+            return std::hash<std::string_view>{}(key.value);
+        }
+    };
+
+    struct SharedPathSegments
+    {
+        std::mutex mutex;
+        Arena arena;
+        std::unordered_set<InternedSegmentKey, InternedSegmentKeyHash> segments;
+
+        StringSlice intern(std::string_view value)
+        {
+            if (value.empty())
+                return {};
+
+            std::lock_guard lock(mutex);
+            auto it = segments.find(InternedSegmentKey{value});
+            if (it != segments.end())
+                return StringSlice(it->value.data(), it->value.size());
+
+            char * dst = arena.alloc(value.size());
+            memcpy(dst, value.data(), value.size());
+            std::string_view stored(dst, value.size());
+            segments.emplace(InternedSegmentKey{stored});
+            return StringSlice(stored.data(), stored.size());
+        }
+    };
+
+    static SharedPathSegments & sharedPathSegments()
+    {
+        static SharedPathSegments segments;
+        return segments;
+    }
+
+    static StringSlice copyPathSegment(std::string_view data)
+    {
+        return sharedPathSegments().intern(data);
+    }
+
     Arena string_arena;
     Arena value_arena;
     std::deque<Node> nodes;
@@ -386,6 +436,13 @@ struct AggregateFunctionMergedJSONPatchData
         node.children.clear();
     }
 
+    static void clearNodeSubtree(Node & node)
+    {
+        node.has_terminal_value = false;
+        node.has_terminal_sort_key = false;
+        clearChildren(node);
+    }
+
     Node & rootNode()
     {
         return nodes.front();
@@ -413,7 +470,7 @@ struct AggregateFunctionMergedJSONPatchData
             return nodes[it->node_index];
 
         Child child;
-        child.name = copyToArena(string_arena, name);
+        child.name = copyPathSegment(name);
         child.node_index = static_cast<UInt32>(nodes.size());
         appendNode();
         it = node.children.insert(it, std::move(child));
@@ -423,7 +480,7 @@ struct AggregateFunctionMergedJSONPatchData
     Node & appendChild(Node & node, std::string_view name)
     {
         Child child;
-        child.name = copyToArena(string_arena, name);
+        child.name = copyPathSegment(name);
         child.node_index = static_cast<UInt32>(nodes.size());
         appendNode();
         node.children.push_back(std::move(child));
@@ -558,8 +615,7 @@ struct AggregateFunctionMergedJSONPatchData
         if (node.has_terminal_sort_key && node.terminal_sort_key > sort_key)
             return;
 
-        node.has_terminal_value = false;
-        node.has_terminal_sort_key = false;
+        clearNodeSubtree(node);
 
         const auto & object = value.safeGet<Object>();
         for (const auto & [child_key, child_value] : object)
@@ -578,6 +634,9 @@ struct AggregateFunctionMergedJSONPatchData
                 return;
 
             bool is_last = (i + 1 == parts.size());
+            if (is_last && current->has_terminal_value)
+                clearNodeSubtree(*current);
+
             current = &getOrCreateChild(*current, parts[i]);
 
             if (is_last)
@@ -799,22 +858,40 @@ struct AggregateFunctionMergedJSONPatchData
                 case EncodedField::Kind::BinaryNonObjectField:
                 case EncodedField::Kind::BinaryObjectField:
                 {
-                    String value_data;
-                    readStringBinary(value_data, buf);
+                    size_t value_size = 0;
+                    readVarUInt(value_size, buf);
+
                     if constexpr (merged_json_patch_debug_logging)
                     {
-                        if (value_data.size() > (1ULL << 20))
+                        if (value_size > (1ULL << 20))
                         {
+                            String value_prefix;
+                            size_t prefix_size = std::min<size_t>(value_size, 64);
+                            value_prefix.resize(prefix_size);
+                            if (prefix_size)
+                                buf.readStrict(value_prefix.data(), prefix_size);
+                            if (value_size > prefix_size)
+                                buf.ignore(value_size - prefix_size);
+
                             throw Exception(
                                 ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
                                 "Suspicious terminal payload while deserializing `mergedJSONPatch` at path '{}': kind={}, size={}, prefix_hex={}",
                                 debugPathToString(debug_deserialize_path),
                                 EncodedField::kindToString(kind),
-                                value_data.size(),
-                                hexForDebug(value_data));
+                                value_size,
+                                hexForDebug(value_prefix));
                         }
                     }
-                    node.terminal_value = EncodedField(kind, copyToArena(value_arena, value_data));
+
+                    StringSlice stored = {};
+                    if (value_size)
+                    {
+                        char * dst = value_arena.alloc(value_size);
+                        buf.readStrict(dst, value_size);
+                        stored = StringSlice(dst, value_size);
+                    }
+
+                    node.terminal_value = EncodedField(kind, stored);
                     break;
                 }
             }
@@ -842,9 +919,10 @@ struct AggregateFunctionMergedJSONPatchData
         node.children.clear();
         node.children.reserve(children_size);
 
+        String key;
         for (size_t i = 0; i < children_size; ++i)
         {
-            String key;
+            key.clear();
             readStringBinary(key, buf);
 
             if constexpr (merged_json_patch_debug_logging)

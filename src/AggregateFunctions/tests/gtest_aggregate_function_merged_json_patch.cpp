@@ -138,6 +138,62 @@ std::vector<Int64> makeIncreasingSortKeys(size_t size)
     return sort_keys;
 }
 
+std::vector<std::map<String, Field>> makeSharedStructureDataset(size_t rows, size_t dependency_count)
+{
+    std::vector<std::map<String, Field>> result;
+    result.reserve(rows);
+
+    for (size_t row = 0; row < rows; ++row)
+    {
+        std::map<String, Field> entry;
+        entry["data.runtime.nodejs.name"] = Field("node-service");
+        entry["data.runtime.nodejs.version"] = Field("20." + toString(row % 3));
+        entry["data.runtime.nodejs.region"] = Field("us-east-" + toString(row % 2));
+        entry["data.runtime.nodejs.env"] = Field("prod");
+
+        for (size_t dep = 0; dep < dependency_count; ++dep)
+            entry["data.runtime.nodejs.dependencies.dep" + toString(dep)] = Field("1." + toString(row) + "." + toString(dep));
+
+        result.push_back(std::move(entry));
+    }
+
+    return result;
+}
+
+String serializeState(
+    const AggregateFunctionPtr & func,
+    const std::vector<std::map<String, Field>> & rows,
+    const std::vector<Int64> & sort_keys)
+{
+    EXPECT_EQ(rows.size(), sort_keys.size());
+
+    PODArray<char> place_buffer;
+    place_buffer.resize(func->sizeOfData());
+    AggregateDataPtr place = place_buffer.data();
+    func->create(place);
+
+    Arena arena;
+    auto json_column = ColumnObject::create({}, 1024, 255);
+    auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+    auto sort_key_column = DataTypeInt64().createColumn();
+
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        obj_col.insert(Field(createObject(rows[i])));
+        sort_key_column->insert(Field(sort_keys[i]));
+    }
+
+    const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+    for (size_t i = 0; i < rows.size(); ++i)
+        func->add(place, columns, i, &arena);
+
+    WriteBufferFromOwnString write_buf;
+    func->serialize(place, write_buf, std::nullopt);
+
+    func->destroy(place);
+    return write_buf.str();
+}
+
 }
 
 TEST(AggregateFunctionMergedJSONPatch, OverlappingPathsWithSortKey)
@@ -389,6 +445,66 @@ TEST(AggregateFunctionMergedJSONPatch, NewerAncestorWinsDuringStateMerge)
 
     func->destroy(place1);
     func->destroy(place2);
+}
+
+TEST(AggregateFunctionMergedJSONPatch, StateMemoryConsumptionSharedStructureMetrics)
+{
+    tryRegisterAggregateFunctions();
+
+    auto func = createMergedJSONPatchFunction(true);
+
+    auto metrics = measureStateSize(
+        func,
+        makeSharedStructureDataset(/* rows */ 20, /* dependency_count */ 64),
+        makeIncreasingSortKeys(20));
+
+    EXPECT_GT(metrics.serialized_bytes, 0U);
+
+    std::cerr << "mergedJSONPatch shared-structure metrics: allocated=" << metrics.allocated_bytes
+              << " serialized=" << metrics.serialized_bytes << std::endl;
+}
+
+TEST(AggregateFunctionMergedJSONPatch, RepeatedDeserializeOfLargeSharedStructureState)
+{
+    tryRegisterAggregateFunctions();
+
+    auto func = createMergedJSONPatchFunction(true);
+    String serialized = serializeState(
+        func,
+        makeSharedStructureDataset(/* rows */ 20, /* dependency_count */ 128),
+        makeIncreasingSortKeys(20));
+
+    for (size_t iteration = 0; iteration < 32; ++iteration)
+    {
+        PODArray<char> place_buffer;
+        place_buffer.resize(func->sizeOfData());
+        AggregateDataPtr place = place_buffer.data();
+        func->create(place);
+
+        Arena arena;
+        ReadBufferFromString read_buf(serialized);
+        ASSERT_NO_THROW(func->deserialize(place, read_buf, std::nullopt, &arena));
+
+        auto result_column = func->getResultType()->createColumn();
+        ASSERT_NO_THROW(func->insertResultInto(place, *result_column, &arena));
+
+        Field result_field;
+        result_column->get(0, result_field);
+        const auto & result_obj = result_field.safeGet<Object>();
+
+        ASSERT_TRUE(result_obj.contains("data"));
+        const auto & data_obj = result_obj.at("data").safeGet<Object>();
+        ASSERT_TRUE(data_obj.contains("runtime"));
+        const auto & runtime_obj = data_obj.at("runtime").safeGet<Object>();
+        ASSERT_TRUE(runtime_obj.contains("nodejs"));
+        const auto & nodejs_obj = runtime_obj.at("nodejs").safeGet<Object>();
+        ASSERT_TRUE(nodejs_obj.contains("name"));
+        EXPECT_EQ(nodejs_obj.at("name").safeGet<String>(), "node-service");
+        ASSERT_TRUE(nodejs_obj.contains("env"));
+        EXPECT_EQ(nodejs_obj.at("env").safeGet<String>(), "prod");
+
+        func->destroy(place);
+    }
 }
 
 TEST(AggregateFunctionMergedJSONPatch, MixedScalarAndObjectArrayElementsAreSanitizedDuringAggregation)
