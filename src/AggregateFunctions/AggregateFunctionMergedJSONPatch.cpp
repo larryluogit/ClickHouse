@@ -11,6 +11,9 @@
 #include <Common/FieldBinaryEncoding.h>
 #include <Core/Field.h>
 
+#include <algorithm>
+#include <memory>
+
 
 namespace DB
 {
@@ -144,36 +147,178 @@ struct AggregateFunctionMergedJSONPatchData
         }
     };
 
+    static constexpr bool merged_json_patch_debug_logging = true;
+
+    static String hexForDebug(std::string_view value, size_t limit = 32)
+    {
+        static constexpr char digits[] = "0123456789abcdef";
+
+        size_t bytes_to_dump = std::min(value.size(), limit);
+        String result;
+        result.reserve(bytes_to_dump * 2);
+
+        for (size_t i = 0; i < bytes_to_dump; ++i)
+        {
+            UInt8 byte = static_cast<UInt8>(value[i]);
+            result.push_back(digits[byte >> 4]);
+            result.push_back(digits[byte & 0x0F]);
+        }
+
+        return result;
+    }
+
+    static String debugPathToString(const std::vector<String> & path)
+    {
+        String result;
+        for (size_t i = 0; i < path.size(); ++i)
+        {
+            if (i != 0)
+                result += ".";
+            result += path[i];
+        }
+        return result;
+    }
+
+
     struct EncodedField
     {
+        enum class Kind : UInt8
+        {
+            Empty = 0,
+            Int64 = 1,
+            UInt64 = 2,
+            String = 3,
+            BinaryNonObjectField = 4,
+            BinaryObjectField = 5,
+        };
+
+        static const char * kindToString(Kind kind)
+        {
+            switch (kind)
+            {
+                case Kind::Empty:
+                    return "Empty";
+                case Kind::Int64:
+                    return "Int64";
+                case Kind::UInt64:
+                    return "UInt64";
+                case Kind::String:
+                    return "String";
+                case Kind::BinaryNonObjectField:
+                    return "BinaryNonObjectField";
+                case Kind::BinaryObjectField:
+                    return "BinaryObjectField";
+            }
+
+            return "Unknown";
+        }
+
+        Kind kind = Kind::Empty;
+        Int64 inline_int64 = 0;
+        UInt64 inline_uint64 = 0;
         StringSlice data;
 
         EncodedField() = default;
 
-        explicit EncodedField(StringSlice data_)
-            : data(data_)
+        explicit EncodedField(Int64 value_)
+            : kind(Kind::Int64)
+            , inline_int64(value_)
+        {
+        }
+
+        explicit EncodedField(UInt64 value_)
+            : kind(Kind::UInt64)
+            , inline_uint64(value_)
+        {
+        }
+
+        EncodedField(Kind kind_, StringSlice data_)
+            : kind(kind_)
+            , data(data_)
         {
         }
 
         Field get() const
         {
-            ReadBufferFromString buf(data.view());
-            return decodeField(buf);
+            switch (kind)
+            {
+                case Kind::Empty:
+                    return {};
+                case Kind::Int64:
+                    return Field(inline_int64);
+                case Kind::UInt64:
+                    return Field(inline_uint64);
+                case Kind::String:
+                    return Field(String(data.view()));
+                case Kind::BinaryNonObjectField:
+                case Kind::BinaryObjectField:
+                {
+                    ReadBufferFromString buf(data.view());
+                    return decodeField(buf);
+                }
+            }
+
+            UNREACHABLE();
         }
+    };
+
+    struct Node;
+
+    struct Child
+    {
+        StringSlice name;
+        UInt32 node_index = 0;
     };
 
     struct Node
     {
-        std::map<String, Node> children;
-        std::optional<EncodedField> terminal_value;
-        std::optional<SortKey> terminal_sort_key;
+        std::vector<Child> children;
+        EncodedField terminal_value;
+        SortKey terminal_sort_key;
+        bool has_terminal_value = false;
+        bool has_terminal_sort_key = false;
+    };
+
+    struct DebugPathScope
+    {
+        std::vector<String> * stack = nullptr;
+
+        DebugPathScope(std::vector<String> * stack_, std::string_view name)
+            : stack(stack_)
+        {
+            if (stack)
+                stack->emplace_back(name);
+        }
+
+        ~DebugPathScope()
+        {
+            if (stack)
+                stack->pop_back();
+        }
     };
 
     Arena string_arena;
     Arena value_arena;
-    Node root;
+    std::deque<Node> nodes;
+    mutable std::vector<String> debug_deserialize_path;
 
-    AggregateFunctionMergedJSONPatchData() = default;
+    AggregateFunctionMergedJSONPatchData()
+    {
+        nodes.emplace_back();
+    }
+
+    size_t getAllocatedBytes() const
+    {
+        size_t result = sizeof(*this);
+        result += string_arena.allocatedBytes();
+        result += value_arena.allocatedBytes();
+        result += nodes.size() * sizeof(Node);
+
+        for (const auto & node : nodes)
+            result += node.children.capacity() * sizeof(Child);
+
+        return result;
+    }
 
     static StringSlice copyToArena(Arena & arena, std::string_view data)
     {
@@ -187,9 +332,24 @@ struct AggregateFunctionMergedJSONPatchData
 
     EncodedField encodeFieldToArena(Field value)
     {
-        WriteBufferFromOwnString buf;
-        encodeField(value, buf);
-        return EncodedField(copyToArena(value_arena, buf.str()));
+        switch (value.getType())
+        {
+            case Field::Types::Int64:
+                return EncodedField(value.safeGet<Int64>());
+            case Field::Types::UInt64:
+                return EncodedField(value.safeGet<UInt64>());
+            case Field::Types::String:
+                return EncodedField(EncodedField::Kind::String, copyToArena(value_arena, value.safeGet<String>()));
+            default:
+            {
+                WriteBufferFromOwnString buf;
+                bool is_object = value.getType() == Field::Types::Object;
+                encodeField(value, buf);
+                return EncodedField(
+                    is_object ? EncodedField::Kind::BinaryObjectField : EncodedField::Kind::BinaryNonObjectField,
+                    copyToArena(value_arena, buf.str()));
+            }
+        }
     }
 
     static bool isObjectField(const Field & value)
@@ -216,33 +376,166 @@ struct AggregateFunctionMergedJSONPatchData
         }
     }
 
-    static void buildFieldFromNode(const Node & node, Field & out)
+    static bool childNameLess(const Child & child, std::string_view name)
     {
-        if (node.terminal_value)
+        return child.name.view() < name;
+    }
+
+    static void clearChildren(Node & node)
+    {
+        node.children.clear();
+    }
+
+    Node & rootNode()
+    {
+        return nodes.front();
+    }
+
+    const Node & rootNode() const
+    {
+        return nodes.front();
+    }
+
+    Node & appendNode()
+    {
+        nodes.emplace_back();
+        return nodes.back();
+    }
+
+    Node & getOrCreateChild(Node & node, std::string_view name)
+    {
+        auto it = std::lower_bound(
+            node.children.begin(),
+            node.children.end(),
+            name,
+            childNameLess);
+        if (it != node.children.end() && it->name.view() == name)
+            return nodes[it->node_index];
+
+        Child child;
+        child.name = copyToArena(string_arena, name);
+        child.node_index = static_cast<UInt32>(nodes.size());
+        appendNode();
+        it = node.children.insert(it, std::move(child));
+        return nodes[it->node_index];
+    }
+
+    Node & appendChild(Node & node, std::string_view name)
+    {
+        Child child;
+        child.name = copyToArena(string_arena, name);
+        child.node_index = static_cast<UInt32>(nodes.size());
+        appendNode();
+        node.children.push_back(std::move(child));
+        return nodes[node.children.back().node_index];
+    }
+
+    void buildFieldFromNode(const Node & node, Field & out) const
+    {
+        if (node.has_terminal_value)
         {
-            out = node.terminal_value->get();
+            out = node.terminal_value.get();
             return;
         }
 
         Object object;
-        for (const auto & [name, child] : node.children)
+        for (const auto & child : node.children)
         {
             Field child_value;
-            buildFieldFromNode(child, child_value);
+            buildFieldFromNode(nodes[child.node_index], child_value);
             if (!child_value.isNull())
-                object[name] = std::move(child_value);
+                object[String(child.name.view())] = std::move(child_value);
         }
 
         out = Field(std::move(object));
     }
 
+    static EncodedField cloneEncodedField(const EncodedField & src, AggregateFunctionMergedJSONPatchData & dst_owner)
+    {
+        switch (src.kind)
+        {
+            case EncodedField::Kind::Empty:
+                return EncodedField();
+            case EncodedField::Kind::Int64:
+                return EncodedField(src.inline_int64);
+            case EncodedField::Kind::UInt64:
+                return EncodedField(src.inline_uint64);
+            case EncodedField::Kind::String:
+            case EncodedField::Kind::BinaryNonObjectField:
+            case EncodedField::Kind::BinaryObjectField:
+                return EncodedField(src.kind, copyToArena(dst_owner.value_arena, src.data.view()));
+        }
+
+        UNREACHABLE();
+    }
+
+    static UInt32 cloneSubtree(const AggregateFunctionMergedJSONPatchData & src_owner, UInt32 src_node_index, AggregateFunctionMergedJSONPatchData & dst_owner)
+    {
+        const Node & src_node = src_owner.nodes[src_node_index];
+        Node & dst_node = dst_owner.appendNode();
+
+        dst_node.has_terminal_value = src_node.has_terminal_value;
+        dst_node.has_terminal_sort_key = src_node.has_terminal_sort_key;
+        dst_node.terminal_sort_key = src_node.terminal_sort_key;
+        if (src_node.has_terminal_value)
+            dst_node.terminal_value = cloneEncodedField(src_node.terminal_value, dst_owner);
+
+        dst_node.children.reserve(src_node.children.size());
+        for (const auto & src_child : src_node.children)
+        {
+            Child dst_child;
+            dst_child.name = copyToArena(dst_owner.string_arena, src_child.name.view());
+            dst_child.node_index = cloneSubtree(src_owner, src_child.node_index, dst_owner);
+            dst_node.children.push_back(dst_child);
+        }
+
+        return static_cast<UInt32>(dst_owner.nodes.size() - 1);
+    }
+
+    static void overwriteNodeWithSubtree(Node & dst, const AggregateFunctionMergedJSONPatchData & src_owner, UInt32 src_node_index, AggregateFunctionMergedJSONPatchData & dst_owner)
+    {
+        const Node & src_node = src_owner.nodes[src_node_index];
+
+        dst.children.clear();
+        dst.children.reserve(src_node.children.size());
+        dst.has_terminal_value = src_node.has_terminal_value;
+        dst.has_terminal_sort_key = src_node.has_terminal_sort_key;
+        dst.terminal_sort_key = src_node.terminal_sort_key;
+        dst.terminal_value = src_node.has_terminal_value ? cloneEncodedField(src_node.terminal_value, dst_owner) : EncodedField();
+
+        for (const auto & src_child : src_node.children)
+        {
+            Child dst_child;
+            dst_child.name = copyToArena(dst_owner.string_arena, src_child.name.view());
+            dst_child.node_index = cloneSubtree(src_owner, src_child.node_index, dst_owner);
+            dst.children.push_back(dst_child);
+        }
+    }
+
+    static bool canOverwriteWithSubtree(const Node & dst, const Node & src)
+    {
+        if (!src.has_terminal_sort_key)
+            return false;
+
+        if (dst.has_terminal_sort_key && dst.terminal_sort_key > src.terminal_sort_key)
+            return false;
+
+        if (!dst.children.empty())
+            return false;
+
+        if (!dst.has_terminal_value)
+            return true;
+
+        return !isObjectField(dst.terminal_value.get());
+    }
+
     static void mergeObjectIntoNode(Node & node, const Object & object, const SortKey & sort_key, AggregateFunctionMergedJSONPatchData & owner)
     {
-        if (node.terminal_sort_key && *node.terminal_sort_key > sort_key)
+        if (node.has_terminal_sort_key && node.terminal_sort_key > sort_key)
             return;
 
-        node.terminal_value.reset();
-        node.terminal_sort_key.reset();
+        node.has_terminal_value = false;
+        node.has_terminal_sort_key = false;
 
         for (const auto & [key, value] : object)
             owner.insertPathValue(node, key, value, sort_key);
@@ -254,17 +547,19 @@ struct AggregateFunctionMergedJSONPatchData
 
         if (!isObjectField(value))
         {
-            node.children.clear();
+            clearChildren(node);
             node.terminal_value = encodeFieldToArena(std::move(value));
             node.terminal_sort_key = sort_key;
+            node.has_terminal_value = true;
+            node.has_terminal_sort_key = true;
             return;
         }
 
-        if (node.terminal_sort_key && *node.terminal_sort_key > sort_key)
+        if (node.has_terminal_sort_key && node.terminal_sort_key > sort_key)
             return;
 
-        node.terminal_value.reset();
-        node.terminal_sort_key.reset();
+        node.has_terminal_value = false;
+        node.has_terminal_sort_key = false;
 
         const auto & object = value.safeGet<Object>();
         for (const auto & [child_key, child_value] : object)
@@ -279,12 +574,11 @@ struct AggregateFunctionMergedJSONPatchData
         Node * current = &start_node;
         for (size_t i = 0; i < parts.size(); ++i)
         {
-            if (current->terminal_sort_key && *current->terminal_sort_key > sort_key)
+            if (current->has_terminal_sort_key && current->terminal_sort_key > sort_key)
                 return;
 
             bool is_last = (i + 1 == parts.size());
-            auto [it, inserted] = current->children.try_emplace(String(parts[i]), Node{});
-            current = &it->second;
+            current = &getOrCreateChild(*current, parts[i]);
 
             if (is_last)
                 insertField(*current, std::move(value), sort_key);
@@ -293,63 +587,165 @@ struct AggregateFunctionMergedJSONPatchData
 
     void insertPathValue(std::string_view path, Field value, const SortKey & sort_key)
     {
-        insertPathValue(root, path, std::move(value), sort_key);
+        insertPathValue(rootNode(), path, std::move(value), sort_key);
     }
 
-    static void mergeNode(Node & dst, const Node & src, AggregateFunctionMergedJSONPatchData & owner)
+    static bool copyTerminalValueIfDominates(Node & dst, const Node & src, AggregateFunctionMergedJSONPatchData & dst_owner)
     {
-        if (src.terminal_value && src.terminal_sort_key)
-        {
-            Field src_value = src.terminal_value->get();
-            if (!isObjectField(src_value))
-            {
-                if (!dst.terminal_sort_key || *dst.terminal_sort_key <= *src.terminal_sort_key)
-                {
-                    dst.children.clear();
-                    dst.terminal_value = owner.encodeFieldToArena(std::move(src_value));
-                    dst.terminal_sort_key = *src.terminal_sort_key;
-                }
-                return;
-            }
+        if (!src.has_terminal_value || !src.has_terminal_sort_key)
+            return false;
 
-            if (!dst.terminal_sort_key || *dst.terminal_sort_key <= *src.terminal_sort_key)
-                mergeObjectIntoNode(dst, src_value.safeGet<Object>(), *src.terminal_sort_key, owner);
+        if (src.terminal_value.kind == EncodedField::Kind::BinaryObjectField)
+            return false;
+
+        if (dst.has_terminal_sort_key && dst.terminal_sort_key > src.terminal_sort_key)
+            return true;
+
+        clearChildren(dst);
+
+        switch (src.terminal_value.kind)
+        {
+            case EncodedField::Kind::Empty:
+                dst.terminal_value = EncodedField();
+                break;
+            case EncodedField::Kind::Int64:
+                dst.terminal_value = EncodedField(src.terminal_value.inline_int64);
+                break;
+            case EncodedField::Kind::UInt64:
+                dst.terminal_value = EncodedField(src.terminal_value.inline_uint64);
+                break;
+            case EncodedField::Kind::String:
+            case EncodedField::Kind::BinaryNonObjectField:
+                dst.terminal_value = EncodedField(
+                    src.terminal_value.kind,
+                    copyToArena(dst_owner.value_arena, src.terminal_value.data.view()));
+                break;
+            case EncodedField::Kind::BinaryObjectField:
+                UNREACHABLE();
         }
 
-        if (dst.terminal_value && dst.terminal_sort_key)
+        dst.terminal_sort_key = src.terminal_sort_key;
+        dst.has_terminal_value = true;
+        dst.has_terminal_sort_key = true;
+        return true;
+    }
+
+    static bool subtreeDominatedByNonObjectTerminal(const Node & node, const SortKey & ancestor_sort_key)
+    {
+        if (node.has_terminal_value && node.has_terminal_sort_key && node.terminal_sort_key <= ancestor_sort_key)
         {
-            Field dst_value = dst.terminal_value->get();
+            if (node.terminal_value.kind != EncodedField::Kind::BinaryObjectField)
+                return true;
+        }
+
+        return false;
+    }
+
+    static void mergeNode(Node & dst, const Node & src, const AggregateFunctionMergedJSONPatchData & src_owner, AggregateFunctionMergedJSONPatchData & dst_owner)
+    {
+        if (copyTerminalValueIfDominates(dst, src, dst_owner))
+            return;
+
+        if (src.has_terminal_value && src.has_terminal_sort_key)
+        {
+            Field src_value = src.terminal_value.get();
+            if (!dst.has_terminal_sort_key || dst.terminal_sort_key <= src.terminal_sort_key)
+                mergeObjectIntoNode(dst, src_value.safeGet<Object>(), src.terminal_sort_key, dst_owner);
+        }
+
+        if (dst.has_terminal_value && dst.has_terminal_sort_key)
+        {
+            Field dst_value = dst.terminal_value.get();
             if (!isObjectField(dst_value))
                 return;
 
-            if (src.terminal_sort_key && *src.terminal_sort_key > *dst.terminal_sort_key)
+            if (src.has_terminal_sort_key && src.terminal_sort_key > dst.terminal_sort_key)
             {
-                dst.terminal_value.reset();
-                dst.terminal_sort_key.reset();
+                dst.has_terminal_value = false;
+                dst.has_terminal_sort_key = false;
             }
         }
 
-        for (const auto & [name, src_child] : src.children)
+        for (const auto & src_child : src.children)
         {
-            auto [it, inserted] = dst.children.try_emplace(name, Node{});
-            mergeNode(it->second, src_child, owner);
+            const Node & src_child_node = src_owner.nodes[src_child.node_index];
+            if (subtreeDominatedByNonObjectTerminal(dst, src_child_node.terminal_sort_key))
+                continue;
+
+            auto it = std::lower_bound(
+                dst.children.begin(),
+                dst.children.end(),
+                src_child.name.view(),
+                childNameLess);
+
+            if (it == dst.children.end() || it->name.view() != src_child.name.view())
+            {
+                if (canOverwriteWithSubtree(dst, src_child_node))
+                {
+                    Child child;
+                    child.name = copyToArena(dst_owner.string_arena, src_child.name.view());
+                    child.node_index = cloneSubtree(src_owner, src_child.node_index, dst_owner);
+                    dst.children.insert(it, std::move(child));
+                    continue;
+                }
+
+                Node & dst_child = dst_owner.getOrCreateChild(dst, src_child.name.view());
+                mergeNode(dst_child, src_child_node, src_owner, dst_owner);
+                continue;
+            }
+
+            Node & dst_child = dst_owner.nodes[it->node_index];
+            if (canOverwriteWithSubtree(dst_child, src_child_node))
+            {
+                overwriteNodeWithSubtree(dst_child, src_owner, src_child.node_index, dst_owner);
+                continue;
+            }
+
+            mergeNode(dst_child, src_child_node, src_owner, dst_owner);
         }
     }
 
-    static void serializeNode(const Node & node, WriteBuffer & buf)
+    void serializeNode(const Node & node, WriteBuffer & buf) const
     {
-        writeBoolText(node.terminal_value.has_value(), buf);
-        if (node.terminal_value)
+        if constexpr (merged_json_patch_debug_logging)
         {
-            writeStringBinary(node.terminal_value->data.view(), buf);
-            encodeField(node.terminal_sort_key->toField(), buf);
+            if (node.has_terminal_value && !node.children.empty())
+            {
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "Invariant violation in `mergedJSONPatch`: terminal node has {} children before serialization",
+                    node.children.size());
+            }
+        }
+
+        writeBoolText(node.has_terminal_value, buf);
+        if (node.has_terminal_value)
+        {
+            writeBinary(static_cast<UInt8>(node.terminal_value.kind), buf);
+            switch (node.terminal_value.kind)
+            {
+                case EncodedField::Kind::Empty:
+                    break;
+                case EncodedField::Kind::Int64:
+                    writeVarInt(node.terminal_value.inline_int64, buf);
+                    break;
+                case EncodedField::Kind::UInt64:
+                    writeVarUInt(node.terminal_value.inline_uint64, buf);
+                    break;
+                case EncodedField::Kind::String:
+                case EncodedField::Kind::BinaryNonObjectField:
+                case EncodedField::Kind::BinaryObjectField:
+                    writeStringBinary(node.terminal_value.data.view(), buf);
+                    break;
+            }
+            encodeField(node.terminal_sort_key.toField(), buf);
         }
 
         writeVarUInt(node.children.size(), buf);
-        for (const auto & [name, child] : node.children)
+        for (const auto & child : node.children)
         {
-            writeStringBinary(name, buf);
-            serializeNode(child, buf);
+            writeStringBinary(child.name.view(), buf);
+            serializeNode(nodes[child.node_index], buf);
         }
     }
 
@@ -359,28 +755,122 @@ struct AggregateFunctionMergedJSONPatchData
         readBoolText(has_terminal, buf);
         if (has_terminal)
         {
-            String value_data;
-            readStringBinary(value_data, buf);
-            node.terminal_value = EncodedField(copyToArena(value_arena, value_data));
+            UInt8 encoded_kind = 0;
+            readBinary(encoded_kind, buf);
+
+            auto kind = static_cast<EncodedField::Kind>(encoded_kind);
+            if constexpr (merged_json_patch_debug_logging)
+            {
+                if (kind != EncodedField::Kind::Empty
+                    && kind != EncodedField::Kind::Int64
+                    && kind != EncodedField::Kind::UInt64
+                    && kind != EncodedField::Kind::String
+                    && kind != EncodedField::Kind::BinaryNonObjectField
+                    && kind != EncodedField::Kind::BinaryObjectField)
+                {
+                    throw Exception(
+                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                        "Invalid terminal kind while deserializing `mergedJSONPatch` at path '{}': byte={}",
+                        debugPathToString(debug_deserialize_path),
+                        static_cast<UInt64>(encoded_kind));
+                }
+            }
+
+            switch (kind)
+            {
+                case EncodedField::Kind::Empty:
+                    node.terminal_value = EncodedField();
+                    break;
+                case EncodedField::Kind::Int64:
+                {
+                    Int64 value = 0;
+                    readVarInt(value, buf);
+                    node.terminal_value = EncodedField(value);
+                    break;
+                }
+                case EncodedField::Kind::UInt64:
+                {
+                    UInt64 value = 0;
+                    readVarUInt(value, buf);
+                    node.terminal_value = EncodedField(value);
+                    break;
+                }
+                case EncodedField::Kind::String:
+                case EncodedField::Kind::BinaryNonObjectField:
+                case EncodedField::Kind::BinaryObjectField:
+                {
+                    String value_data;
+                    readStringBinary(value_data, buf);
+                    if constexpr (merged_json_patch_debug_logging)
+                    {
+                        if (value_data.size() > (1ULL << 20))
+                        {
+                            throw Exception(
+                                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                                "Suspicious terminal payload while deserializing `mergedJSONPatch` at path '{}': kind={}, size={}, prefix_hex={}",
+                                debugPathToString(debug_deserialize_path),
+                                EncodedField::kindToString(kind),
+                                value_data.size(),
+                                hexForDebug(value_data));
+                        }
+                    }
+                    node.terminal_value = EncodedField(kind, copyToArena(value_arena, value_data));
+                    break;
+                }
+            }
+
             node.terminal_sort_key = SortKey(decodeField(buf));
+
+            node.has_terminal_value = true;
+            node.has_terminal_sort_key = true;
         }
 
         size_t children_size = 0;
         readVarUInt(children_size, buf);
+        if constexpr (merged_json_patch_debug_logging)
+        {
+            if (children_size > (1ULL << 20))
+            {
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "Suspicious children count while deserializing `mergedJSONPatch` at path '{}': {}",
+                    debugPathToString(debug_deserialize_path),
+                    children_size);
+            }
+        }
+
+        node.children.clear();
+        node.children.reserve(children_size);
+
         for (size_t i = 0; i < children_size; ++i)
         {
             String key;
             readStringBinary(key, buf);
-            auto [it, inserted] = node.children.try_emplace(key, Node{});
-            deserializeNode(it->second, buf);
+
+            if constexpr (merged_json_patch_debug_logging)
+            {
+                if (key.size() > (1ULL << 16))
+                {
+                    throw Exception(
+                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                        "Suspicious child key length while deserializing `mergedJSONPatch` at path '{}': key_size={}, key_prefix_hex={}",
+                        debugPathToString(debug_deserialize_path),
+                        key.size(),
+                        hexForDebug(key));
+                }
+            }
+
+            Node & child = appendChild(node, key);
+            DebugPathScope path_scope(merged_json_patch_debug_logging ? &debug_deserialize_path : nullptr, key);
+            deserializeNode(child, buf);
         }
     }
 
-    static void collectObject(const Node & node, Object & out)
+    void collectObject(const Node & node, Object & out) const
     {
-        if (node.terminal_value)
+        if (node.has_terminal_value)
         {
-            Field value = node.terminal_value->get();
+            Field value = node.terminal_value.get();
             if (isObjectField(value))
             {
                 const auto & object = value.safeGet<Object>();
@@ -390,12 +880,13 @@ struct AggregateFunctionMergedJSONPatchData
             return;
         }
 
-        for (const auto & [name, child] : node.children)
+        for (const auto & child : node.children)
         {
             Field child_value;
-            buildFieldFromNode(child, child_value);
+            buildFieldFromNode(nodes[child.node_index], child_value);
+
             if (!child_value.isNull())
-                out[name] = std::move(child_value);
+                out[String(child.name.view())] = std::move(child_value);
         }
     }
 
@@ -435,18 +926,20 @@ struct AggregateFunctionMergedJSONPatchData
 
     void merge(const AggregateFunctionMergedJSONPatchData & other, Arena *)
     {
-        mergeNode(root, other.root, *this);
+        mergeNode(rootNode(), other.rootNode(), other, *this);
     }
 
     void serialize(WriteBuffer & buf) const
     {
-        serializeNode(root, buf);
+        serializeNode(rootNode(), buf);
     }
 
     void deserialize(ReadBuffer & buf, Arena *)
     {
-        root = Node{};
-        deserializeNode(root, buf);
+        nodes.clear();
+        nodes.emplace_back();
+        debug_deserialize_path.clear();
+        deserializeNode(rootNode(), buf);
     }
 
     void insertResultInto(IColumn & to, const DataTypePtr &) const
@@ -454,7 +947,7 @@ struct AggregateFunctionMergedJSONPatchData
         auto & result_column = assert_cast<ColumnObject &>(to);
 
         Object result_object;
-        collectObject(root, result_object);
+        collectObject(rootNode(), result_object);
 
         if (result_object.empty())
         {

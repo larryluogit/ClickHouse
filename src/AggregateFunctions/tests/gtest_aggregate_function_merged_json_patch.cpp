@@ -10,6 +10,8 @@
 #include <Common/tests/gtest_global_register.h>
 #include <base/defines.h>
 
+#include <numeric>
+
 /// Unit tests for AggregateFunctionMergedJSONPatch with triplet state storage
 ///
 /// This function stores state as triplets (key, value, sorting_key) to enable
@@ -56,6 +58,84 @@ AggregateFunctionPtr createMergedJSONPatchFunction(bool with_sort_key = false)
     Array parameters;
     AggregateFunctionProperties properties;
     return factory.get("mergedJSONPatch", NullsAction::EMPTY, argument_types, parameters, properties);
+}
+
+struct StateSizeMetrics
+{
+    size_t allocated_bytes = 0;
+    size_t serialized_bytes = 0;
+};
+
+StateSizeMetrics measureStateSize(
+    const AggregateFunctionPtr & func,
+    const std::vector<std::map<String, Field>> & rows,
+    const std::vector<Int64> & sort_keys)
+{
+    EXPECT_EQ(rows.size(), sort_keys.size());
+
+    PODArray<char> place_buffer;
+    place_buffer.resize(func->sizeOfData());
+    AggregateDataPtr place = place_buffer.data();
+    func->create(place);
+
+    Arena arena;
+    auto json_column = ColumnObject::create({}, 1024, 255);
+    auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+    auto sort_key_column = DataTypeInt64().createColumn();
+
+    for (size_t i = 0; i < rows.size(); ++i)
+    {
+        obj_col.insert(Field(createObject(rows[i])));
+        sort_key_column->insert(Field(sort_keys[i]));
+    }
+
+    const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+    for (size_t i = 0; i < rows.size(); ++i)
+        func->add(place, columns, i, &arena);
+
+    WriteBufferFromOwnString write_buf;
+    func->serialize(place, write_buf, std::nullopt);
+
+    StateSizeMetrics metrics;
+    metrics.allocated_bytes = write_buf.str().size();
+    metrics.serialized_bytes = write_buf.str().size();
+
+    func->destroy(place);
+    return metrics;
+}
+
+std::vector<std::map<String, Field>> makeRepeatedUpdatesDataset(size_t updates)
+{
+    std::vector<std::map<String, Field>> rows;
+    rows.reserve(updates);
+
+    for (size_t i = 0; i < updates; ++i)
+    {
+        rows.push_back({
+            {"a", Field(Int64(i))},
+            {"name", Field("stable")}
+        });
+    }
+
+    return rows;
+}
+
+std::vector<std::map<String, Field>> makeWideDependencyDataset(size_t dependency_count)
+{
+    std::map<String, Field> row;
+    row["data.runtime.nodejs.name"] = Field("node-service");
+
+    for (size_t i = 0; i < dependency_count; ++i)
+        row["data.runtime.nodejs.dependencies.dep" + toString(i)] = Field("1.0." + toString(i));
+
+    return {row};
+}
+
+std::vector<Int64> makeIncreasingSortKeys(size_t size)
+{
+    std::vector<Int64> sort_keys(size);
+    std::iota(sort_keys.begin(), sort_keys.end(), 1);
+    return sort_keys;
 }
 
 }
@@ -664,6 +744,39 @@ TEST(AggregateFunctionMergedJSONPatch, WideSubtreeSerializesAsNestedTree)
     EXPECT_EQ(data_children, 1);
 
     func->destroy(place);
+}
+
+TEST(AggregateFunctionMergedJSONPatch, StateMemoryConsumptionMetrics)
+{
+    tryRegisterAggregateFunctions();
+
+    auto func = createMergedJSONPatchFunction(true);
+
+    const auto repeated_updates_rows = makeRepeatedUpdatesDataset(256);
+    const auto repeated_updates_keys = makeIncreasingSortKeys(repeated_updates_rows.size());
+    const auto repeated_updates_metrics = measureStateSize(func, repeated_updates_rows, repeated_updates_keys);
+
+    const auto wide_dependency_rows = makeWideDependencyDataset(256);
+    const auto wide_dependency_keys = makeIncreasingSortKeys(wide_dependency_rows.size());
+    const auto wide_dependency_metrics = measureStateSize(func, wide_dependency_rows, wide_dependency_keys);
+
+    EXPECT_GT(repeated_updates_metrics.allocated_bytes, 0);
+    EXPECT_GT(repeated_updates_metrics.serialized_bytes, 0);
+    EXPECT_GT(wide_dependency_metrics.allocated_bytes, 0);
+    EXPECT_GT(wide_dependency_metrics.serialized_bytes, 0);
+
+    EXPECT_LT(repeated_updates_metrics.serialized_bytes, 1024UL);
+    EXPECT_LT(repeated_updates_metrics.allocated_bytes, 32 * 1024UL);
+
+    EXPECT_LT(wide_dependency_metrics.serialized_bytes, 32 * 1024UL);
+    EXPECT_LT(wide_dependency_metrics.allocated_bytes, 128 * 1024UL);
+
+    std::cerr
+        << "mergedJSONPatch state metrics: repeated_updates allocated=" << repeated_updates_metrics.allocated_bytes
+        << " serialized=" << repeated_updates_metrics.serialized_bytes
+        << "; wide_dependencies allocated=" << wide_dependency_metrics.allocated_bytes
+        << " serialized=" << wide_dependency_metrics.serialized_bytes
+        << std::endl;
 }
 
 
