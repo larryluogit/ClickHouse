@@ -275,8 +275,10 @@ struct AggregateFunctionMergedJSONPatchData
         std::vector<Child> children;
         EncodedField terminal_value;
         SortKey terminal_sort_key;
+        StringSlice serialized_subtree;
         bool has_terminal_value = false;
         bool has_terminal_sort_key = false;
+        bool has_serialized_subtree = false;
     };
 
     struct DebugPathScope
@@ -440,6 +442,8 @@ struct AggregateFunctionMergedJSONPatchData
     {
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
+        node.has_serialized_subtree = false;
+        node.serialized_subtree = {};
         clearChildren(node);
     }
 
@@ -489,6 +493,15 @@ struct AggregateFunctionMergedJSONPatchData
 
     void buildFieldFromNode(const Node & node, Field & out) const
     {
+        if (node.has_serialized_subtree)
+        {
+            Node expanded = node;
+            auto & mutable_self = const_cast<AggregateFunctionMergedJSONPatchData &>(*this);
+            ensureExpanded(expanded, mutable_self);
+            buildFieldFromNode(expanded, out);
+            return;
+        }
+
         if (node.has_terminal_value)
         {
             out = node.terminal_value.get();
@@ -534,8 +547,11 @@ struct AggregateFunctionMergedJSONPatchData
         dst_node.has_terminal_value = src_node.has_terminal_value;
         dst_node.has_terminal_sort_key = src_node.has_terminal_sort_key;
         dst_node.terminal_sort_key = src_node.terminal_sort_key;
+        dst_node.has_serialized_subtree = src_node.has_serialized_subtree;
         if (src_node.has_terminal_value)
             dst_node.terminal_value = cloneEncodedField(src_node.terminal_value, dst_owner);
+        if (src_node.has_serialized_subtree)
+            dst_node.serialized_subtree = copyToArena(dst_owner.value_arena, src_node.serialized_subtree.view());
 
         dst_node.children.reserve(src_node.children.size());
         for (const auto & src_child : src_node.children)
@@ -559,6 +575,8 @@ struct AggregateFunctionMergedJSONPatchData
         dst.has_terminal_sort_key = src_node.has_terminal_sort_key;
         dst.terminal_sort_key = src_node.terminal_sort_key;
         dst.terminal_value = src_node.has_terminal_value ? cloneEncodedField(src_node.terminal_value, dst_owner) : EncodedField();
+        dst.has_serialized_subtree = false;
+        dst.serialized_subtree = {};
 
         for (const auto & src_child : src_node.children)
         {
@@ -577,7 +595,7 @@ struct AggregateFunctionMergedJSONPatchData
         if (dst.has_terminal_sort_key && dst.terminal_sort_key > src.terminal_sort_key)
             return false;
 
-        if (!dst.children.empty())
+        if (!dst.children.empty() || dst.has_serialized_subtree)
             return false;
 
         if (!dst.has_terminal_value)
@@ -700,8 +718,48 @@ struct AggregateFunctionMergedJSONPatchData
         return false;
     }
 
+    static void ensureExpanded(Node & node, AggregateFunctionMergedJSONPatchData & owner)
+    {
+        if (!node.has_serialized_subtree)
+            return;
+
+        ReadBufferFromMemory subtree_buf(node.serialized_subtree.data, node.serialized_subtree.size);
+        node.has_serialized_subtree = false;
+        node.serialized_subtree = {};
+        node.has_terminal_value = false;
+        node.has_terminal_sort_key = false;
+        node.terminal_value = EncodedField();
+        node.children.clear();
+        deserializeNodeExpanded(node, subtree_buf, owner);
+    }
+
     static void mergeNode(Node & dst, const Node & src, const AggregateFunctionMergedJSONPatchData & src_owner, AggregateFunctionMergedJSONPatchData & dst_owner)
     {
+        ensureExpanded(dst, dst_owner);
+
+        if (src.has_serialized_subtree && !src.has_terminal_value && src.children.empty())
+        {
+            if (!dst.has_terminal_value && dst.children.empty() && !dst.has_serialized_subtree)
+            {
+                dst.has_terminal_value = false;
+                dst.has_terminal_sort_key = false;
+                dst.terminal_value = EncodedField();
+                dst.has_serialized_subtree = true;
+                dst.serialized_subtree = copyToArena(dst_owner.value_arena, src.serialized_subtree.view());
+                return;
+            }
+
+            AggregateFunctionMergedJSONPatchData expanded_src_owner;
+            expanded_src_owner.debug_deserialize_path = src_owner.debug_deserialize_path;
+            expanded_src_owner.nodes.emplace_back();
+            Node & expanded_src_root = expanded_src_owner.rootNode();
+            expanded_src_root.has_serialized_subtree = true;
+            expanded_src_root.serialized_subtree = copyToArena(expanded_src_owner.value_arena, src.serialized_subtree.view());
+            ensureExpanded(expanded_src_root, expanded_src_owner);
+            mergeNode(dst, expanded_src_root, expanded_src_owner, dst_owner);
+            return;
+        }
+
         if (copyTerminalValueIfDominates(dst, src, dst_owner))
             return;
 
@@ -766,6 +824,12 @@ struct AggregateFunctionMergedJSONPatchData
 
     void serializeNode(const Node & node, WriteBuffer & buf) const
     {
+        if (node.has_serialized_subtree)
+        {
+            buf.write(node.serialized_subtree.data, node.serialized_subtree.size);
+            return;
+        }
+
         if constexpr (merged_json_patch_debug_logging)
         {
             if (node.has_terminal_value && !node.children.empty())
@@ -808,7 +872,7 @@ struct AggregateFunctionMergedJSONPatchData
         }
     }
 
-    void deserializeNode(Node & node, ReadBuffer & buf)
+    static void deserializeNodeExpanded(Node & node, ReadBuffer & buf, AggregateFunctionMergedJSONPatchData & owner)
     {
         bool has_terminal = false;
         readBoolText(has_terminal, buf);
@@ -830,7 +894,7 @@ struct AggregateFunctionMergedJSONPatchData
                     throw Exception(
                         ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
                         "Invalid terminal kind while deserializing `mergedJSONPatch` at path '{}': byte={}",
-                        debugPathToString(debug_deserialize_path),
+                        debugPathToString(owner.debug_deserialize_path),
                         static_cast<UInt64>(encoded_kind));
                 }
             }
@@ -876,7 +940,7 @@ struct AggregateFunctionMergedJSONPatchData
                             throw Exception(
                                 ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
                                 "Suspicious terminal payload while deserializing `mergedJSONPatch` at path '{}': kind={}, size={}, prefix_hex={}",
-                                debugPathToString(debug_deserialize_path),
+                                debugPathToString(owner.debug_deserialize_path),
                                 EncodedField::kindToString(kind),
                                 value_size,
                                 hexForDebug(value_prefix));
@@ -886,7 +950,7 @@ struct AggregateFunctionMergedJSONPatchData
                     StringSlice stored = {};
                     if (value_size)
                     {
-                        char * dst = value_arena.alloc(value_size);
+                        char * dst = owner.value_arena.alloc(value_size);
                         buf.readStrict(dst, value_size);
                         stored = StringSlice(dst, value_size);
                     }
@@ -911,7 +975,7 @@ struct AggregateFunctionMergedJSONPatchData
                 throw Exception(
                     ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
                     "Suspicious children count while deserializing `mergedJSONPatch` at path '{}': {}",
-                    debugPathToString(debug_deserialize_path),
+                    debugPathToString(owner.debug_deserialize_path),
                     children_size);
             }
         }
@@ -932,20 +996,112 @@ struct AggregateFunctionMergedJSONPatchData
                     throw Exception(
                         ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
                         "Suspicious child key length while deserializing `mergedJSONPatch` at path '{}': key_size={}, key_prefix_hex={}",
-                        debugPathToString(debug_deserialize_path),
+                        debugPathToString(owner.debug_deserialize_path),
                         key.size(),
                         hexForDebug(key));
                 }
             }
 
-            Node & child = appendChild(node, key);
-            DebugPathScope path_scope(merged_json_patch_debug_logging ? &debug_deserialize_path : nullptr, key);
-            deserializeNode(child, buf);
+            Node & child = owner.appendChild(node, key);
+            DebugPathScope path_scope(merged_json_patch_debug_logging ? &owner.debug_deserialize_path : nullptr, key);
+            owner.deserializeNode(child, buf);
         }
+    }
+
+    void deserializeNode(Node & node, ReadBuffer & buf)
+    {
+        node.has_terminal_value = false;
+        node.has_terminal_sort_key = false;
+        node.has_serialized_subtree = true;
+        node.terminal_value = EncodedField();
+        node.children.clear();
+
+        WriteBufferFromOwnString capture_buf;
+
+        bool has_terminal = false;
+        readBoolText(has_terminal, buf);
+        writeBoolText(has_terminal, capture_buf);
+
+        if (has_terminal)
+        {
+            UInt8 encoded_kind = 0;
+            readBinary(encoded_kind, buf);
+            writeBinary(encoded_kind, capture_buf);
+
+            auto kind = static_cast<EncodedField::Kind>(encoded_kind);
+            switch (kind)
+            {
+                case EncodedField::Kind::Empty:
+                    break;
+                case EncodedField::Kind::Int64:
+                {
+                    Int64 value = 0;
+                    readVarInt(value, buf);
+                    writeVarInt(value, capture_buf);
+                    break;
+                }
+                case EncodedField::Kind::UInt64:
+                {
+                    UInt64 value = 0;
+                    readVarUInt(value, buf);
+                    writeVarUInt(value, capture_buf);
+                    break;
+                }
+                case EncodedField::Kind::String:
+                case EncodedField::Kind::BinaryNonObjectField:
+                case EncodedField::Kind::BinaryObjectField:
+                {
+                    size_t value_size = 0;
+                    readVarUInt(value_size, buf);
+                    writeVarUInt(value_size, capture_buf);
+
+                    if (value_size)
+                    {
+                        String value;
+                        value.resize(value_size);
+                        buf.readStrict(value.data(), value_size);
+                        capture_buf.write(value.data(), value_size);
+                    }
+                    break;
+                }
+            }
+
+            Field terminal_sort_key = decodeField(buf);
+            encodeField(terminal_sort_key, capture_buf);
+        }
+
+        size_t children_size = 0;
+        readVarUInt(children_size, buf);
+        writeVarUInt(children_size, capture_buf);
+
+        String key;
+        for (size_t i = 0; i < children_size; ++i)
+        {
+            key.clear();
+            readStringBinary(key, buf);
+            writeStringBinary(key, capture_buf);
+            DebugPathScope path_scope(merged_json_patch_debug_logging ? &debug_deserialize_path : nullptr, key);
+
+            Node skipped_child;
+            deserializeNode(skipped_child, buf);
+            capture_buf.write(skipped_child.serialized_subtree.data, skipped_child.serialized_subtree.size);
+        }
+
+        capture_buf.finalize();
+        node.serialized_subtree = copyToArena(value_arena, capture_buf.str());
     }
 
     void collectObject(const Node & node, Object & out) const
     {
+        if (node.has_serialized_subtree)
+        {
+            Node expanded = node;
+            auto & mutable_self = const_cast<AggregateFunctionMergedJSONPatchData &>(*this);
+            ensureExpanded(expanded, mutable_self);
+            collectObject(expanded, out);
+            return;
+        }
+
         if (node.has_terminal_value)
         {
             Field value = node.terminal_value.get();
