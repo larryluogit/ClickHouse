@@ -276,6 +276,7 @@ struct AggregateFunctionMergedJSONPatchData
         EncodedField terminal_value;
         SortKey terminal_sort_key;
         StringSlice serialized_subtree;
+        UInt64 serialized_subtree_top_level_children = 0;
         bool has_terminal_value = false;
         bool has_terminal_sort_key = false;
         bool has_serialized_subtree = false;
@@ -299,54 +300,9 @@ struct AggregateFunctionMergedJSONPatchData
         }
     };
 
-    struct InternedSegmentKey
+    StringSlice copyPathSegment(std::string_view data)
     {
-        std::string_view value;
-
-        bool operator==(const InternedSegmentKey & other) const = default;
-    };
-
-    struct InternedSegmentKeyHash
-    {
-        size_t operator()(const InternedSegmentKey & key) const
-        {
-            return std::hash<std::string_view>{}(key.value);
-        }
-    };
-
-    struct SharedPathSegments
-    {
-        std::mutex mutex;
-        Arena arena;
-        std::unordered_set<InternedSegmentKey, InternedSegmentKeyHash> segments;
-
-        StringSlice intern(std::string_view value)
-        {
-            if (value.empty())
-                return {};
-
-            std::lock_guard lock(mutex);
-            auto it = segments.find(InternedSegmentKey{value});
-            if (it != segments.end())
-                return StringSlice(it->value.data(), it->value.size());
-
-            char * dst = arena.alloc(value.size());
-            memcpy(dst, value.data(), value.size());
-            std::string_view stored(dst, value.size());
-            segments.emplace(InternedSegmentKey{stored});
-            return StringSlice(stored.data(), stored.size());
-        }
-    };
-
-    static SharedPathSegments & sharedPathSegments()
-    {
-        static SharedPathSegments segments;
-        return segments;
-    }
-
-    static StringSlice copyPathSegment(std::string_view data)
-    {
-        return sharedPathSegments().intern(data);
+        return copyToArena(string_arena, data);
     }
 
     Arena string_arena;
@@ -548,6 +504,7 @@ struct AggregateFunctionMergedJSONPatchData
         dst_node.has_terminal_sort_key = src_node.has_terminal_sort_key;
         dst_node.terminal_sort_key = src_node.terminal_sort_key;
         dst_node.has_serialized_subtree = src_node.has_serialized_subtree;
+        dst_node.serialized_subtree_top_level_children = src_node.serialized_subtree_top_level_children;
         if (src_node.has_terminal_value)
             dst_node.terminal_value = cloneEncodedField(src_node.terminal_value, dst_owner);
         if (src_node.has_serialized_subtree)
@@ -575,6 +532,7 @@ struct AggregateFunctionMergedJSONPatchData
         dst.terminal_sort_key = src_node.terminal_sort_key;
         dst.terminal_value = src_node.has_terminal_value ? cloneEncodedField(src_node.terminal_value, dst_owner) : EncodedField();
         dst.has_serialized_subtree = src_node.has_serialized_subtree;
+        dst.serialized_subtree_top_level_children = src_node.serialized_subtree_top_level_children;
         dst.serialized_subtree = src_node.has_serialized_subtree
             ? copyToArena(dst_owner.value_arena, src_node.serialized_subtree.view())
             : StringSlice{};
@@ -731,6 +689,7 @@ struct AggregateFunctionMergedJSONPatchData
         ReadBufferFromMemory subtree_buf(node.serialized_subtree.data, node.serialized_subtree.size);
         node.has_serialized_subtree = false;
         node.serialized_subtree = {};
+        node.serialized_subtree_top_level_children = 0;
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
         node.terminal_value = EncodedField();
@@ -751,6 +710,7 @@ struct AggregateFunctionMergedJSONPatchData
                 dst.has_terminal_sort_key = false;
                 dst.terminal_value = EncodedField();
                 dst.has_serialized_subtree = true;
+                dst.serialized_subtree_top_level_children = src.serialized_subtree_top_level_children;
                 dst.serialized_subtree = copyToArena(dst_owner.value_arena, src.serialized_subtree.view());
                 return;
             }
@@ -763,9 +723,20 @@ struct AggregateFunctionMergedJSONPatchData
                 dst.terminal_sort_key = src.terminal_sort_key;
                 dst.terminal_value = EncodedField();
                 dst.has_serialized_subtree = true;
+                dst.serialized_subtree_top_level_children = src.serialized_subtree_top_level_children;
                 dst.serialized_subtree = copyToArena(dst_owner.value_arena, src.serialized_subtree.view());
                 return;
             }
+
+        }
+
+        if (dst.has_serialized_subtree
+            && dst.serialized_subtree_top_level_children == 0
+            && !src.has_serialized_subtree
+            && src.children.empty())
+        {
+            if (copyTerminalValueIfDominates(dst, src, dst_owner))
+                return;
         }
 
         ensureExpanded(dst, dst_owner);
@@ -891,14 +862,88 @@ struct AggregateFunctionMergedJSONPatchData
         }
     }
 
-    static void deserializeNodeExpanded(Node & node, ReadBuffer & buf, AggregateFunctionMergedJSONPatchData & owner)
+    struct SerializedSubtreeBuilder
     {
+        String data;
+        std::vector<size_t> node_offsets;
+
+        void append(std::string_view value)
+        {
+            data.append(value.data(), value.size());
+        }
+
+        void appendByte(UInt8 value)
+        {
+            data.push_back(static_cast<char>(value));
+        }
+
+        void appendBoolText(bool value)
+        {
+            append(value ? std::string_view("true", 4) : std::string_view("false", 5));
+        }
+
+        void appendVarUInt(UInt64 value)
+        {
+            while (value >= 0x80)
+            {
+                appendByte(static_cast<UInt8>(value) | 0x80);
+                value >>= 7;
+            }
+
+            appendByte(static_cast<UInt8>(value));
+        }
+
+        void appendVarInt(Int64 value)
+        {
+            appendVarUInt((static_cast<UInt64>(value) << 1) ^ static_cast<UInt64>(value >> 63));
+        }
+
+        void appendStringBinary(std::string_view value)
+        {
+            appendVarUInt(value.size());
+            append(value);
+        }
+
+        void appendEncodedFieldBinary(const Field & value)
+        {
+            WriteBufferFromOwnString buf;
+            encodeField(value, buf);
+            buf.finalize();
+            append(buf.str());
+        }
+
+        void beginNode()
+        {
+            node_offsets.push_back(data.size());
+        }
+
+        std::string_view finishNode() const
+        {
+            return std::string_view(data.data() + node_offsets.back(), data.size() - node_offsets.back());
+        }
+
+        void popNode()
+        {
+            node_offsets.pop_back();
+        }
+    };
+
+    static void deserializeNodeExpanded(Node & node, ReadBuffer & buf, AggregateFunctionMergedJSONPatchData & owner, SerializedSubtreeBuilder * capture = nullptr)
+    {
+        if (capture)
+            capture->beginNode();
+
         bool has_terminal = false;
         readBoolText(has_terminal, buf);
+        if (capture)
+            capture->appendBoolText(has_terminal);
+
         if (has_terminal)
         {
             UInt8 encoded_kind = 0;
             readBinary(encoded_kind, buf);
+            if (capture)
+                capture->appendByte(encoded_kind);
 
             auto kind = static_cast<EncodedField::Kind>(encoded_kind);
             if constexpr (merged_json_patch_debug_logging)
@@ -927,6 +972,8 @@ struct AggregateFunctionMergedJSONPatchData
                 {
                     Int64 value = 0;
                     readVarInt(value, buf);
+                    if (capture)
+                        capture->appendVarInt(value);
                     node.terminal_value = EncodedField(value);
                     break;
                 }
@@ -934,6 +981,8 @@ struct AggregateFunctionMergedJSONPatchData
                 {
                     UInt64 value = 0;
                     readVarUInt(value, buf);
+                    if (capture)
+                        capture->appendVarUInt(value);
                     node.terminal_value = EncodedField(value);
                     break;
                 }
@@ -943,6 +992,8 @@ struct AggregateFunctionMergedJSONPatchData
                 {
                     size_t value_size = 0;
                     readVarUInt(value_size, buf);
+                    if (capture)
+                        capture->appendVarUInt(value_size);
 
                     if constexpr (merged_json_patch_debug_logging)
                     {
@@ -969,9 +1020,19 @@ struct AggregateFunctionMergedJSONPatchData
                     StringSlice stored = {};
                     if (value_size)
                     {
-                        char * dst = owner.value_arena.alloc(value_size);
-                        buf.readStrict(dst, value_size);
-                        stored = StringSlice(dst, value_size);
+                        if (capture)
+                        {
+                            size_t old_size = capture->data.size();
+                            capture->data.resize(old_size + value_size);
+                            buf.readStrict(capture->data.data() + old_size, value_size);
+                            stored = StringSlice(capture->data.data() + old_size, value_size);
+                        }
+                        else
+                        {
+                            char * dst = owner.value_arena.alloc(value_size);
+                            buf.readStrict(dst, value_size);
+                            stored = StringSlice(dst, value_size);
+                        }
                     }
 
                     node.terminal_value = EncodedField(kind, stored);
@@ -979,7 +1040,10 @@ struct AggregateFunctionMergedJSONPatchData
                 }
             }
 
-            node.terminal_sort_key = SortKey(decodeField(buf));
+            Field terminal_sort_key = decodeField(buf);
+            if (capture)
+                capture->appendEncodedFieldBinary(terminal_sort_key);
+            node.terminal_sort_key = SortKey(std::move(terminal_sort_key));
 
             node.has_terminal_value = true;
             node.has_terminal_sort_key = true;
@@ -987,6 +1051,8 @@ struct AggregateFunctionMergedJSONPatchData
 
         size_t children_size = 0;
         readVarUInt(children_size, buf);
+        if (capture)
+            capture->appendVarUInt(children_size);
         if constexpr (merged_json_patch_debug_logging)
         {
             if (children_size > (1ULL << 20))
@@ -1007,6 +1073,8 @@ struct AggregateFunctionMergedJSONPatchData
         {
             key.clear();
             readStringBinary(key, buf);
+            if (capture)
+                capture->appendStringBinary(key);
 
             if constexpr (merged_json_patch_debug_logging)
             {
@@ -1023,7 +1091,15 @@ struct AggregateFunctionMergedJSONPatchData
 
             Node & child = owner.appendChild(node, key);
             DebugPathScope path_scope(merged_json_patch_debug_logging ? &owner.debug_deserialize_path : nullptr, key);
-            owner.deserializeNode(child, buf);
+            deserializeNodeExpanded(child, buf, owner, capture);
+        }
+
+        if (capture)
+        {
+            std::string_view subtree = capture->finishNode();
+            node.serialized_subtree = copyToArena(owner.value_arena, subtree);
+            node.serialized_subtree_top_level_children = children_size;
+            capture->popNode();
         }
     }
 
@@ -1035,12 +1111,8 @@ struct AggregateFunctionMergedJSONPatchData
         node.terminal_value = EncodedField();
         node.children.clear();
 
-        deserializeNodeExpanded(node, buf, *this);
-
-        WriteBufferFromOwnString capture_buf;
-        serializeNode(node, capture_buf);
-        capture_buf.finalize();
-        node.serialized_subtree = copyToArena(value_arena, capture_buf.str());
+        SerializedSubtreeBuilder capture;
+        deserializeNodeExpanded(node, buf, *this, &capture);
 
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
