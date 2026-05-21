@@ -807,9 +807,96 @@ TEST(AggregateFunctionMergedJSONPatch, MergeOfCompactedStatesKeepsOnlyWinningEnt
     func->destroy(right);
 }
 
+TEST(AggregateFunctionMergedJSONPatch, PartialTopLevelOverlapWithSerializedStateMergesCorrectly)
+{
+   tryRegisterAggregateFunctions();
+
+   auto func = createMergedJSONPatchFunction(true);
+
+   PODArray<char> left_buffer;
+   PODArray<char> right_buffer;
+   PODArray<char> right_deserialized_buffer;
+   left_buffer.resize(func->sizeOfData());
+   right_buffer.resize(func->sizeOfData());
+   right_deserialized_buffer.resize(func->sizeOfData());
+
+   AggregateDataPtr left = left_buffer.data();
+   AggregateDataPtr right = right_buffer.data();
+   AggregateDataPtr right_deserialized = right_deserialized_buffer.data();
+   func->create(left);
+   func->create(right);
+   func->create(right_deserialized);
+
+   Arena arena;
+
+   {
+       auto json_column = ColumnObject::create({}, 1024, 255);
+       auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+       auto sort_key_column = DataTypeInt64().createColumn();
+
+       obj_col.insert(Field(createObject({
+           {"service.name", Field("svc")},
+           {"service.version", Field("1.0")},
+           {"service.env", Field("prod")},
+           {"service.region", Field("us-east")},
+           {"service.owner", Field("team-a")}
+       })));
+       sort_key_column->insert(Field(Int64(1)));
+
+       const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+       func->add(right, columns, 0, &arena);
+   }
+
+   {
+       auto json_column = ColumnObject::create({}, 1024, 255);
+       auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+       auto sort_key_column = DataTypeInt64().createColumn();
+
+       obj_col.insert(Field(createObject({
+           {"service.version", Field("2.0")},
+           {"service.region", Field("eu-west")},
+           {"other", Field("value")}
+       })));
+       sort_key_column->insert(Field(Int64(2)));
+
+       const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+       func->add(left, columns, 0, &arena);
+   }
+
+   WriteBufferFromOwnString write_buf;
+   func->serialize(right, write_buf, std::nullopt);
+
+   ReadBufferFromString read_buf(write_buf.str());
+   func->deserialize(right_deserialized, read_buf, std::nullopt, &arena);
+
+   func->merge(left, right_deserialized, &arena);
+
+   auto result_column = func->getResultType()->createColumn();
+   func->insertResultInto(left, *result_column, &arena);
+
+   Field result_field;
+   result_column->get(0, result_field);
+   const auto & result_obj = result_field.safeGet<Object>();
+
+   ASSERT_TRUE(result_obj.contains("service"));
+   ASSERT_TRUE(result_obj.contains("other"));
+
+   const auto & service = result_obj.at("service").safeGet<Object>();
+   EXPECT_EQ(getStringFromObject(service, "name"), "svc");
+   EXPECT_EQ(getStringFromObject(service, "version"), "2.0");
+   EXPECT_EQ(getStringFromObject(service, "env"), "prod");
+   EXPECT_EQ(getStringFromObject(service, "region"), "eu-west");
+   EXPECT_EQ(getStringFromObject(service, "owner"), "team-a");
+   EXPECT_EQ(result_obj.at("other").safeGet<String>(), "value");
+
+   func->destroy(left);
+   func->destroy(right);
+   func->destroy(right_deserialized);
+}
+
 TEST(AggregateFunctionMergedJSONPatch, WideSubtreeSerializesAsNestedTree)
 {
-    tryRegisterAggregateFunctions();
+   tryRegisterAggregateFunctions();
 
     auto func = createMergedJSONPatchFunction(true);
 

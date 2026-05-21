@@ -270,6 +270,13 @@ struct AggregateFunctionMergedJSONPatchData
         UInt32 node_index = 0;
     };
 
+    struct SerializedChildSubtree
+    {
+        StringSlice name;
+        UInt64 offset = 0;
+        UInt64 size = 0;
+    };
+
     struct Node
     {
         std::vector<Child> children;
@@ -277,6 +284,7 @@ struct AggregateFunctionMergedJSONPatchData
         SortKey terminal_sort_key;
         StringSlice serialized_subtree;
         UInt64 serialized_subtree_top_level_children = 0;
+        std::vector<SerializedChildSubtree> serialized_child_subtrees;
         bool has_terminal_value = false;
         bool has_terminal_sort_key = false;
         bool has_serialized_subtree = false;
@@ -394,13 +402,128 @@ struct AggregateFunctionMergedJSONPatchData
         node.children.clear();
     }
 
+    static void clearSerializedSubtree(Node & node)
+    {
+        node.has_serialized_subtree = false;
+        node.serialized_subtree = {};
+        node.serialized_subtree_top_level_children = 0;
+        node.serialized_child_subtrees.clear();
+    }
+
     static void clearNodeSubtree(Node & node)
     {
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
-        node.has_serialized_subtree = false;
-        node.serialized_subtree = {};
+        clearSerializedSubtree(node);
         clearChildren(node);
+    }
+
+    static const SerializedChildSubtree * findSerializedChildSubtree(const Node & node, std::string_view name)
+    {
+        auto it = std::lower_bound(
+            node.serialized_child_subtrees.begin(),
+            node.serialized_child_subtrees.end(),
+            name,
+            [](const SerializedChildSubtree & child, std::string_view child_name)
+            {
+                return child.name.view() < child_name;
+            });
+
+        if (it == node.serialized_child_subtrees.end() || it->name.view() != name)
+            return nullptr;
+
+        return &*it;
+    }
+
+    static void copySerializedSubtreeToNode(
+        Node & dst,
+        const Node & src_node,
+        const SerializedChildSubtree & src_child_subtree,
+        AggregateFunctionMergedJSONPatchData & dst_owner)
+    {
+        clearNodeSubtree(dst);
+        dst.has_serialized_subtree = true;
+        dst.serialized_subtree_top_level_children = 0;
+        dst.serialized_subtree = copyToArena(
+            dst_owner.value_arena,
+            std::string_view(src_node.serialized_subtree.data + src_child_subtree.offset, src_child_subtree.size));
+    }
+
+    static void materializeSerializedChildren(
+        Node & dst,
+        const Node & src,
+        std::span<const StringSlice> names,
+        const AggregateFunctionMergedJSONPatchData & src_owner,
+        AggregateFunctionMergedJSONPatchData & dst_owner)
+    {
+        if (!dst.has_serialized_subtree || names.empty())
+            return;
+
+        std::vector<SerializedChildSubtree> matched_child_subtrees;
+        matched_child_subtrees.reserve(names.size());
+
+        for (const auto & name : names)
+        {
+            const auto * child_subtree = findSerializedChildSubtree(dst, name.view());
+            if (child_subtree)
+                matched_child_subtrees.push_back(*child_subtree);
+        }
+
+        if (matched_child_subtrees.empty())
+            return;
+
+        std::sort(
+            matched_child_subtrees.begin(),
+            matched_child_subtrees.end(),
+            [](const SerializedChildSubtree & lhs, const SerializedChildSubtree & rhs)
+            {
+                return lhs.name.view() < rhs.name.view();
+            });
+
+        StringSlice serialized_subtree = dst.serialized_subtree;
+        clearSerializedSubtree(dst);
+
+        for (const auto & child_subtree : matched_child_subtrees)
+        {
+            auto it = std::lower_bound(
+                dst.children.begin(),
+                dst.children.end(),
+                child_subtree.name.view(),
+                childNameLess);
+
+            if (it != dst.children.end() && it->name.view() == child_subtree.name.view())
+                continue;
+
+            Child child;
+            child.name = copyToArena(dst_owner.string_arena, child_subtree.name.view());
+            child.node_index = static_cast<UInt32>(dst_owner.nodes.size());
+            dst_owner.appendNode();
+            Node & dst_child = dst_owner.nodes[child.node_index];
+            dst_child.has_serialized_subtree = true;
+            dst_child.serialized_subtree_top_level_children = 0;
+            dst_child.serialized_subtree = copyToArena(
+                dst_owner.value_arena,
+                std::string_view(serialized_subtree.data + child_subtree.offset, child_subtree.size));
+            dst.children.insert(it, std::move(child));
+        }
+
+        const Node & src_node = src;
+        for (const auto & src_child : src_node.children)
+        {
+            auto dst_it = std::lower_bound(
+                dst.children.begin(),
+                dst.children.end(),
+                src_child.name.view(),
+                childNameLess);
+
+            if (dst_it == dst.children.end() || dst_it->name.view() != src_child.name.view())
+                continue;
+
+            Node & dst_child = dst_owner.nodes[dst_it->node_index];
+            const Node & src_child_node = src_owner.nodes[src_child.node_index];
+            if (canOverwriteWithSubtree(dst_child, src_child_node))
+                overwriteNodeWithSubtree(dst_child, src_owner, src_child.node_index, dst_owner);
+        }
     }
 
     Node & rootNode()
@@ -536,6 +659,16 @@ struct AggregateFunctionMergedJSONPatchData
         dst.serialized_subtree = src_node.has_serialized_subtree
             ? copyToArena(dst_owner.value_arena, src_node.serialized_subtree.view())
             : StringSlice{};
+        dst.serialized_child_subtrees.clear();
+        dst.serialized_child_subtrees.reserve(src_node.serialized_child_subtrees.size());
+        for (const auto & src_child_subtree : src_node.serialized_child_subtrees)
+        {
+            SerializedChildSubtree dst_child_subtree;
+            dst_child_subtree.name = copyToArena(dst_owner.string_arena, src_child_subtree.name.view());
+            dst_child_subtree.offset = src_child_subtree.offset;
+            dst_child_subtree.size = src_child_subtree.size;
+            dst.serialized_child_subtrees.push_back(dst_child_subtree);
+        }
 
         if (src_node.has_serialized_subtree)
             return;
@@ -690,6 +823,7 @@ struct AggregateFunctionMergedJSONPatchData
         node.has_serialized_subtree = false;
         node.serialized_subtree = {};
         node.serialized_subtree_top_level_children = 0;
+        node.serialized_child_subtrees.clear();
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
         node.terminal_value = EncodedField();
@@ -737,6 +871,23 @@ struct AggregateFunctionMergedJSONPatchData
         {
             if (copyTerminalValueIfDominates(dst, src, dst_owner))
                 return;
+        }
+
+        if (dst.has_serialized_subtree
+            && !dst.serialized_child_subtrees.empty()
+            && !src.children.empty())
+        {
+            std::vector<StringSlice> overlapping_names;
+            overlapping_names.reserve(src.children.size());
+
+            for (const auto & src_child : src.children)
+            {
+                if (findSerializedChildSubtree(dst, src_child.name.view()))
+                    overlapping_names.push_back(src_child.name);
+            }
+
+            if (!overlapping_names.empty() && overlapping_names.size() < dst.serialized_subtree_top_level_children)
+                materializeSerializedChildren(dst, src, overlapping_names, src_owner, dst_owner);
         }
 
         ensureExpanded(dst, dst_owner);
@@ -864,8 +1015,14 @@ struct AggregateFunctionMergedJSONPatchData
 
     struct SerializedSubtreeBuilder
     {
+        struct NodeFrame
+        {
+            size_t offset = 0;
+            std::vector<SerializedChildSubtree> child_subtrees;
+        };
+
         String data;
-        std::vector<size_t> node_offsets;
+        std::vector<NodeFrame> node_frames;
 
         void append(std::string_view value)
         {
@@ -914,17 +1071,33 @@ struct AggregateFunctionMergedJSONPatchData
 
         void beginNode()
         {
-            node_offsets.push_back(data.size());
+            NodeFrame frame;
+            frame.offset = data.size();
+            node_frames.push_back(std::move(frame));
         }
 
-        std::string_view finishNode() const
+        void recordChildSubtree(std::string_view name, size_t child_offset, size_t child_size)
         {
-            return std::string_view(data.data() + node_offsets.back(), data.size() - node_offsets.back());
+            auto & frame = node_frames.back();
+            frame.child_subtrees.push_back(SerializedChildSubtree{
+                .name = StringSlice(name.data(), name.size()),
+                .offset = child_offset - frame.offset,
+                .size = child_size,
+            });
+        }
+
+        std::pair<std::string_view, const std::vector<SerializedChildSubtree> &> finishNode() const
+        {
+            const auto & frame = node_frames.back();
+            return {
+                std::string_view(data.data() + frame.offset, data.size() - frame.offset),
+                frame.child_subtrees
+            };
         }
 
         void popNode()
         {
-            node_offsets.pop_back();
+            node_frames.pop_back();
         }
     };
 
@@ -1072,6 +1245,7 @@ struct AggregateFunctionMergedJSONPatchData
         for (size_t i = 0; i < children_size; ++i)
         {
             key.clear();
+            size_t child_capture_offset = capture ? capture->data.size() : 0;
             readStringBinary(key, buf);
             if (capture)
                 capture->appendStringBinary(key);
@@ -1092,13 +1266,29 @@ struct AggregateFunctionMergedJSONPatchData
             Node & child = owner.appendChild(node, key);
             DebugPathScope path_scope(merged_json_patch_debug_logging ? &owner.debug_deserialize_path : nullptr, key);
             deserializeNodeExpanded(child, buf, owner, capture);
+
+            if (capture)
+            {
+                size_t child_capture_end = capture->data.size();
+                capture->recordChildSubtree(key, child_capture_offset, child_capture_end - child_capture_offset);
+            }
         }
 
         if (capture)
         {
-            std::string_view subtree = capture->finishNode();
+            auto [subtree, child_subtrees] = capture->finishNode();
             node.serialized_subtree = copyToArena(owner.value_arena, subtree);
             node.serialized_subtree_top_level_children = children_size;
+            node.serialized_child_subtrees.clear();
+            node.serialized_child_subtrees.reserve(child_subtrees.size());
+            for (const auto & child_subtree : child_subtrees)
+            {
+                SerializedChildSubtree stored_child_subtree;
+                stored_child_subtree.name = copyToArena(owner.string_arena, child_subtree.name.view());
+                stored_child_subtree.offset = child_subtree.offset;
+                stored_child_subtree.size = child_subtree.size;
+                node.serialized_child_subtrees.push_back(stored_child_subtree);
+            }
             capture->popNode();
         }
     }
@@ -1110,6 +1300,7 @@ struct AggregateFunctionMergedJSONPatchData
         node.has_serialized_subtree = false;
         node.terminal_value = EncodedField();
         node.children.clear();
+        node.serialized_child_subtrees.clear();
 
         SerializedSubtreeBuilder capture;
         deserializeNodeExpanded(node, buf, *this, &capture);
