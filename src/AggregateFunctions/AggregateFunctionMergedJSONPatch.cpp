@@ -149,24 +149,6 @@ struct AggregateFunctionMergedJSONPatchData
 
     static constexpr bool merged_json_patch_debug_logging = true;
 
-    static String hexForDebug(std::string_view value, size_t limit = 32)
-    {
-        static constexpr char digits[] = "0123456789abcdef";
-
-        size_t bytes_to_dump = std::min(value.size(), limit);
-        String result;
-        result.reserve(bytes_to_dump * 2);
-
-        for (size_t i = 0; i < bytes_to_dump; ++i)
-        {
-            UInt8 byte = static_cast<UInt8>(value[i]);
-            result.push_back(digits[byte >> 4]);
-            result.push_back(digits[byte & 0x0F]);
-        }
-
-        return result;
-    }
-
     static String debugPathToString(const std::vector<String> & path)
     {
         String result;
@@ -313,36 +295,14 @@ struct AggregateFunctionMergedJSONPatchData
         return copyToArena(string_arena, data);
     }
 
-    struct DeserializeInstrumentation
-    {
-        size_t retained_serialized_subtree_nodes = 0;
-        size_t expanded_only_nodes = 0;
-        size_t retained_serialized_subtree_bytes = 0;
-        size_t skipped_serialized_subtree_bytes = 0;
-    };
-
     Arena string_arena;
     Arena value_arena;
     std::deque<Node> nodes;
-    DeserializeInstrumentation deserialize_instrumentation;
     mutable std::vector<String> debug_deserialize_path;
 
     AggregateFunctionMergedJSONPatchData()
     {
         nodes.emplace_back();
-    }
-
-    size_t getAllocatedBytes() const
-    {
-        size_t result = sizeof(*this);
-        result += string_arena.allocatedBytes();
-        result += value_arena.allocatedBytes();
-        result += nodes.size() * sizeof(Node);
-
-        for (const auto & node : nodes)
-            result += node.children.capacity() * sizeof(Child);
-
-        return result;
     }
 
     static StringSlice copyToArena(Arena & arena, std::string_view data)
@@ -1181,28 +1141,6 @@ struct AggregateFunctionMergedJSONPatchData
                     if (capture)
                         capture->appendVarUInt(value_size);
 
-                    if constexpr (merged_json_patch_debug_logging)
-                    {
-                        if (value_size > (1ULL << 20))
-                        {
-                            String value_prefix;
-                            size_t prefix_size = std::min<size_t>(value_size, 64);
-                            value_prefix.resize(prefix_size);
-                            if (prefix_size)
-                                buf.readStrict(value_prefix.data(), prefix_size);
-                            if (value_size > prefix_size)
-                                buf.ignore(value_size - prefix_size);
-
-                            throw Exception(
-                                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                                "Suspicious terminal payload while deserializing `mergedJSONPatch` at path '{}': kind={}, size={}, prefix_hex={}",
-                                debugPathToString(owner.debug_deserialize_path),
-                                EncodedField::kindToString(kind),
-                                value_size,
-                                hexForDebug(value_prefix));
-                        }
-                    }
-
                     StringSlice stored = {};
                     if (value_size)
                     {
@@ -1232,18 +1170,6 @@ struct AggregateFunctionMergedJSONPatchData
         readVarUInt(children_size, buf);
         if (capture)
             capture->appendVarUInt(children_size);
-        if constexpr (merged_json_patch_debug_logging)
-        {
-            if (children_size > (1ULL << 20))
-            {
-                throw Exception(
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                    "Suspicious children count while deserializing `mergedJSONPatch` at path '{}': {}",
-                    debugPathToString(owner.debug_deserialize_path),
-                    children_size);
-            }
-        }
-
         node.children.clear();
         node.children.reserve(children_size);
 
@@ -1255,19 +1181,6 @@ struct AggregateFunctionMergedJSONPatchData
             readStringBinary(key, buf);
             if (capture)
                 capture->appendStringBinary(key);
-
-            if constexpr (merged_json_patch_debug_logging)
-            {
-                if (key.size() > (1ULL << 16))
-                {
-                    throw Exception(
-                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                        "Suspicious child key length while deserializing `mergedJSONPatch` at path '{}': key_size={}, key_prefix_hex={}",
-                        debugPathToString(owner.debug_deserialize_path),
-                        key.size(),
-                        hexForDebug(key));
-                }
-            }
 
             Node & child = owner.appendChild(node, key);
             DebugPathScope path_scope(merged_json_patch_debug_logging ? &owner.debug_deserialize_path : nullptr, key);
@@ -1320,14 +1233,9 @@ struct AggregateFunctionMergedJSONPatchData
 
         if (!keep_serialized_subtree)
         {
-            deserialize_instrumentation.expanded_only_nodes += 1;
-            deserialize_instrumentation.skipped_serialized_subtree_bytes += node.serialized_subtree.size;
             clearSerializedSubtree(node);
             return;
         }
-
-        deserialize_instrumentation.retained_serialized_subtree_nodes += 1;
-        deserialize_instrumentation.retained_serialized_subtree_bytes += node.serialized_subtree.size;
 
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
