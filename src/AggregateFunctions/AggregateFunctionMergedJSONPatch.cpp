@@ -261,14 +261,28 @@ struct AggregateFunctionMergedJSONPatchData
 
     struct Node
     {
+        /// RFC 7396 says that writing a non-object value at path `a` replaces the whole subtree at `a`.
+        /// In `mergedJSONPatch` we combine that with last-write-wins ordering: a whole-subtree replacement
+        /// is allowed only if it is newer than every effective winner currently stored under that subtree.
+        ///
+        /// To implement this without storing per-descendant summaries, each node tracks the maximum sort key
+        /// among effective winners in its current subtree. Parent replacement can then compare against a
+        /// single summary value:
+        /// - if `sort_key >= subtree_max_sort_key`, the whole replacement wins;
+        /// - otherwise the whole replacement loses.
+        ///
+        /// Partial replacement is not allowed. If any effective descendant winner is newer, the parent write
+        /// cannot replace only the older descendants; it must lose entirely.
         std::vector<Child> children;
         EncodedField terminal_value;
         SortKey terminal_sort_key;
+        SortKey subtree_max_sort_key;
         StringSlice serialized_subtree;
         UInt64 serialized_subtree_top_level_children = 0;
         std::vector<SerializedChildSubtree> serialized_child_subtrees;
         bool has_terminal_value = false;
         bool has_terminal_sort_key = false;
+        bool has_subtree_max_sort_key = false;
         bool has_serialized_subtree = false;
     };
 
@@ -383,8 +397,38 @@ struct AggregateFunctionMergedJSONPatchData
     {
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
+        node.has_subtree_max_sort_key = false;
         clearSerializedSubtree(node);
         clearChildren(node);
+    }
+
+    static void refreshSubtreeMaxSortKey(Node & node, const std::deque<Node> & nodes)
+    {
+        node.has_subtree_max_sort_key = false;
+
+        if (node.has_terminal_sort_key)
+        {
+            node.subtree_max_sort_key = node.terminal_sort_key;
+            node.has_subtree_max_sort_key = true;
+        }
+
+        for (const auto & child : node.children)
+        {
+            const Node & child_node = nodes[child.node_index];
+            if (!child_node.has_subtree_max_sort_key)
+                continue;
+
+            if (!node.has_subtree_max_sort_key || node.subtree_max_sort_key < child_node.subtree_max_sort_key)
+            {
+                node.subtree_max_sort_key = child_node.subtree_max_sort_key;
+                node.has_subtree_max_sort_key = true;
+            }
+        }
+    }
+
+    static bool subtreeReplacementWins(const Node & node, const SortKey & sort_key)
+    {
+        return !node.has_subtree_max_sort_key || node.subtree_max_sort_key <= sort_key;
     }
 
     static const SerializedChildSubtree * findSerializedChildSubtree(const Node & node, std::string_view name)
@@ -599,6 +643,8 @@ struct AggregateFunctionMergedJSONPatchData
         dst_node.has_terminal_value = src_node.has_terminal_value;
         dst_node.has_terminal_sort_key = src_node.has_terminal_sort_key;
         dst_node.terminal_sort_key = src_node.terminal_sort_key;
+        dst_node.has_subtree_max_sort_key = src_node.has_subtree_max_sort_key;
+        dst_node.subtree_max_sort_key = src_node.subtree_max_sort_key;
         dst_node.has_serialized_subtree = src_node.has_serialized_subtree;
         dst_node.serialized_subtree_top_level_children = src_node.serialized_subtree_top_level_children;
         if (src_node.has_terminal_value)
@@ -626,6 +672,8 @@ struct AggregateFunctionMergedJSONPatchData
         dst.has_terminal_value = src_node.has_terminal_value;
         dst.has_terminal_sort_key = src_node.has_terminal_sort_key;
         dst.terminal_sort_key = src_node.terminal_sort_key;
+        dst.has_subtree_max_sort_key = src_node.has_subtree_max_sort_key;
+        dst.subtree_max_sort_key = src_node.subtree_max_sort_key;
         dst.terminal_value = src_node.has_terminal_value ? cloneEncodedField(src_node.terminal_value, dst_owner) : EncodedField();
         dst.has_serialized_subtree = src_node.has_serialized_subtree;
         dst.serialized_subtree_top_level_children = src_node.serialized_subtree_top_level_children;
@@ -691,11 +739,17 @@ struct AggregateFunctionMergedJSONPatchData
 
         if (!isObjectField(value))
         {
+            if (!subtreeReplacementWins(node, sort_key))
+                return;
+
             clearChildren(node);
+            clearSerializedSubtree(node);
             node.terminal_value = encodeFieldToArena(std::move(value));
             node.terminal_sort_key = sort_key;
+            node.subtree_max_sort_key = sort_key;
             node.has_terminal_value = true;
             node.has_terminal_sort_key = true;
+            node.has_subtree_max_sort_key = true;
             return;
         }
 
@@ -715,6 +769,10 @@ struct AggregateFunctionMergedJSONPatchData
         splitPath(path, parts);
 
         Node * current = &start_node;
+        std::vector<Node *> visited_nodes;
+        visited_nodes.reserve(parts.size() + 1);
+        visited_nodes.push_back(current);
+
         for (size_t i = 0; i < parts.size(); ++i)
         {
             if (current->has_terminal_sort_key && current->terminal_sort_key > sort_key)
@@ -725,10 +783,14 @@ struct AggregateFunctionMergedJSONPatchData
                 clearNodeSubtree(*current);
 
             current = &getOrCreateChild(*current, parts[i]);
+            visited_nodes.push_back(current);
 
             if (is_last)
                 insertField(*current, std::move(value), sort_key);
         }
+
+        for (auto it = visited_nodes.rbegin(); it != visited_nodes.rend(); ++it)
+            refreshSubtreeMaxSortKey(**it, nodes);
     }
 
     void insertPathValue(std::string_view path, Field value, const SortKey & sort_key)
@@ -771,8 +833,10 @@ struct AggregateFunctionMergedJSONPatchData
         }
 
         dst.terminal_sort_key = src.terminal_sort_key;
+        dst.subtree_max_sort_key = src.terminal_sort_key;
         dst.has_terminal_value = true;
         dst.has_terminal_sort_key = true;
+        dst.has_subtree_max_sort_key = true;
         return true;
     }
 
@@ -799,6 +863,7 @@ struct AggregateFunctionMergedJSONPatchData
         node.serialized_child_subtrees.clear();
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
+        node.has_subtree_max_sort_key = false;
         node.terminal_value = EncodedField();
         node.children.clear();
         deserializeNodeExpanded(node, subtree_buf, owner);
@@ -934,6 +999,8 @@ struct AggregateFunctionMergedJSONPatchData
 
             mergeNode(dst_child, src_child_node, src_owner, dst_owner);
         }
+
+        refreshSubtreeMaxSortKey(dst, dst_owner.nodes);
     }
 
     void serializeNode(const Node & node, WriteBuffer & buf) const
@@ -1161,9 +1228,11 @@ struct AggregateFunctionMergedJSONPatchData
             if (capture)
                 capture->appendEncodedFieldBinary(terminal_sort_key);
             node.terminal_sort_key = SortKey(std::move(terminal_sort_key));
+            node.subtree_max_sort_key = node.terminal_sort_key;
 
             node.has_terminal_value = true;
             node.has_terminal_sort_key = true;
+            node.has_subtree_max_sort_key = true;
         }
 
         size_t children_size = 0;
@@ -1217,6 +1286,7 @@ struct AggregateFunctionMergedJSONPatchData
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
         node.has_serialized_subtree = false;
+        node.has_subtree_max_sort_key = false;
         node.terminal_value = EncodedField();
         node.children.clear();
         node.serialized_child_subtrees.clear();
@@ -1242,6 +1312,7 @@ struct AggregateFunctionMergedJSONPatchData
         node.has_serialized_subtree = true;
         node.terminal_value = EncodedField();
         node.children.clear();
+        refreshSubtreeMaxSortKey(node, nodes);
     }
 
     void collectObject(const Node & node, Object & out) const

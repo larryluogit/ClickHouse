@@ -236,6 +236,8 @@ TEST(AggregateFunctionMergedJSONPatch, OverlappingPathsWithSortKey)
 
 TEST(AggregateFunctionMergedJSONPatch, DistributedQueryMerge)
 {
+    tryRegisterAggregateFunctions();
+
     auto func = createMergedJSONPatchFunction(true);
     PODArray<char> place1_buffer;
     PODArray<char> place2_buffer;
@@ -445,6 +447,86 @@ TEST(AggregateFunctionMergedJSONPatch, NewerAncestorWinsDuringStateMerge)
 
     func->destroy(place1);
     func->destroy(place2);
+}
+
+TEST(AggregateFunctionMergedJSONPatch, OlderAncestorDoesNotOverwriteNewerExpandedDescendants)
+{
+    tryRegisterAggregateFunctions();
+
+    auto func = createMergedJSONPatchFunction(true);
+    PODArray<char> place_buffer;
+    place_buffer.resize(func->sizeOfData());
+    AggregateDataPtr place = place_buffer.data();
+    func->create(place);
+
+    Arena arena;
+    auto json_column = ColumnObject::create({}, 1024, 255);
+    auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+    auto sort_key_column = DataTypeInt64().createColumn();
+
+    obj_col.insert(Field(createObject({{"a.x", Field(Int64(1))}, {"a.y", Field(Int64(2))}})));
+    sort_key_column->insert(Field(Int64(10)));
+    obj_col.insert(Field(createObject({{"a", Field(Int64(3))}})));
+    sort_key_column->insert(Field(Int64(9)));
+
+    const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+    for (size_t i = 0; i < 2; ++i)
+        func->add(place, columns, i, &arena);
+
+    auto result_column = func->getResultType()->createColumn();
+    func->insertResultInto(place, *result_column, &arena);
+
+    Field result_field;
+    result_column->get(0, result_field);
+    const auto & result_obj = result_field.safeGet<Object>();
+
+    ASSERT_TRUE(result_obj.contains("a"));
+    const auto & a_obj = result_obj.at("a").safeGet<Object>();
+    EXPECT_EQ(getInt64FromObject(a_obj, "x"), 1);
+    EXPECT_EQ(getInt64FromObject(a_obj, "y"), 2);
+
+    func->destroy(place);
+}
+
+TEST(AggregateFunctionMergedJSONPatch, OlderAncestorLosesIfAnyEffectiveDescendantIsNewer)
+{
+    tryRegisterAggregateFunctions();
+
+    auto func = createMergedJSONPatchFunction(true);
+    PODArray<char> place_buffer;
+    place_buffer.resize(func->sizeOfData());
+    AggregateDataPtr place = place_buffer.data();
+    func->create(place);
+
+    Arena arena;
+    auto json_column = ColumnObject::create({}, 1024, 255);
+    auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+    auto sort_key_column = DataTypeInt64().createColumn();
+
+    obj_col.insert(Field(createObject({{"a.x", Field(Int64(1))}})));
+    sort_key_column->insert(Field(Int64(10)));
+    obj_col.insert(Field(createObject({{"a.y", Field(Int64(2))}})));
+    sort_key_column->insert(Field(Int64(3)));
+    obj_col.insert(Field(createObject({{"a", Field(Int64(5))}})));
+    sort_key_column->insert(Field(Int64(5)));
+
+    const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+    for (size_t i = 0; i < 3; ++i)
+        func->add(place, columns, i, &arena);
+
+    auto result_column = func->getResultType()->createColumn();
+    func->insertResultInto(place, *result_column, &arena);
+
+    Field result_field;
+    result_column->get(0, result_field);
+    const auto & result_obj = result_field.safeGet<Object>();
+
+    ASSERT_TRUE(result_obj.contains("a"));
+    const auto & a_obj = result_obj.at("a").safeGet<Object>();
+    EXPECT_EQ(getInt64FromObject(a_obj, "x"), 1);
+    EXPECT_EQ(getInt64FromObject(a_obj, "y"), 2);
+
+    func->destroy(place);
 }
 
 TEST(AggregateFunctionMergedJSONPatch, StateMemoryConsumptionSharedStructureMetrics)
