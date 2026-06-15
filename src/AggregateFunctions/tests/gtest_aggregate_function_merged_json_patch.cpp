@@ -546,7 +546,7 @@ TEST(AggregateFunctionMergedJSONPatch, StateMemoryConsumptionSharedStructureMetr
               << " serialized=" << metrics.serialized_bytes << std::endl;
 }
 
-TEST(AggregateFunctionMergedJSONPatch, DeserializeRetentionHeuristicPreservesSmallAndLargeStates)
+TEST(AggregateFunctionMergedJSONPatch, SerializeDeserializePreservesSmallAndLargeStates)
 {
     tryRegisterAggregateFunctions();
 
@@ -561,9 +561,6 @@ TEST(AggregateFunctionMergedJSONPatch, DeserializeRetentionHeuristicPreservesSma
         func,
         makeSharedStructureDataset(/* rows */ 20, /* dependency_count */ 128),
         makeIncreasingSortKeys(20));
-
-    EXPECT_LT(small_serialized.size(), 256U);
-    EXPECT_GT(large_serialized.size(), 256U);
 
     PODArray<char> small_place_buffer;
     PODArray<char> large_place_buffer;
@@ -583,9 +580,12 @@ TEST(AggregateFunctionMergedJSONPatch, DeserializeRetentionHeuristicPreservesSma
     func->deserialize(large_place, large_read_buf, std::nullopt, &arena);
 
     WriteBufferFromOwnString reserialized_small_buf;
+    WriteBufferFromOwnString reserialized_large_buf;
     func->serialize(small_place, reserialized_small_buf, std::nullopt);
+    func->serialize(large_place, reserialized_large_buf, std::nullopt);
 
     EXPECT_EQ(reserialized_small_buf.str(), small_serialized);
+    EXPECT_EQ(reserialized_large_buf.str(), large_serialized);
 
     auto small_result_column = func->getResultType()->createColumn();
     auto large_result_column = func->getResultType()->createColumn();
@@ -612,12 +612,6 @@ TEST(AggregateFunctionMergedJSONPatch, DeserializeRetentionHeuristicPreservesSma
 
     EXPECT_EQ(getStringFromObject(nodejs_obj, "name"), "node-service");
     EXPECT_EQ(getStringFromObject(nodejs_obj, "env"), "prod");
-
-    std::cerr << "mergedJSONPatch deserialize heuristic metrics: small_serialized="
-              << small_serialized.size()
-              << " large_serialized="
-              << large_serialized.size()
-              << std::endl;
 
     func->destroy(small_place);
     func->destroy(large_place);
@@ -966,114 +960,114 @@ TEST(AggregateFunctionMergedJSONPatch, MergeOfCompactedStatesKeepsOnlyWinningEnt
     func->destroy(right);
 }
 
-TEST(AggregateFunctionMergedJSONPatch, PartialTopLevelOverlapWithSerializedStateMergesCorrectly)
+TEST(AggregateFunctionMergedJSONPatch, MergeAfterDeserializePreservesNestedObjectUpdates)
 {
-   tryRegisterAggregateFunctions();
+    tryRegisterAggregateFunctions();
 
-   auto func = createMergedJSONPatchFunction(true);
+    auto func = createMergedJSONPatchFunction(true);
 
-   PODArray<char> left_buffer;
-   PODArray<char> right_buffer;
-   PODArray<char> right_deserialized_buffer;
-   left_buffer.resize(func->sizeOfData());
-   right_buffer.resize(func->sizeOfData());
-   right_deserialized_buffer.resize(func->sizeOfData());
+    PODArray<char> left_buffer;
+    PODArray<char> right_buffer;
+    PODArray<char> right_deserialized_buffer;
+    left_buffer.resize(func->sizeOfData());
+    right_buffer.resize(func->sizeOfData());
+    right_deserialized_buffer.resize(func->sizeOfData());
 
-   AggregateDataPtr left = left_buffer.data();
-   AggregateDataPtr right = right_buffer.data();
-   AggregateDataPtr right_deserialized = right_deserialized_buffer.data();
-   func->create(left);
-   func->create(right);
-   func->create(right_deserialized);
+    AggregateDataPtr left = left_buffer.data();
+    AggregateDataPtr right = right_buffer.data();
+    AggregateDataPtr right_deserialized = right_deserialized_buffer.data();
+    func->create(left);
+    func->create(right);
+    func->create(right_deserialized);
 
-   Arena arena;
+    Arena arena;
 
-   {
-       auto json_column = ColumnObject::create({}, 1024, 255);
-       auto & obj_col = assert_cast<ColumnObject &>(*json_column);
-       auto sort_key_column = DataTypeInt64().createColumn();
+    {
+        auto json_column = ColumnObject::create({}, 1024, 255);
+        auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+        auto sort_key_column = DataTypeInt64().createColumn();
 
-       obj_col.insert(Field(createObject({
-           {"service.name", Field("svc")},
-           {"service.version", Field("1.0")},
-           {"service.env", Field("prod")},
-           {"service.region", Field("us-east")},
-           {"service.owner", Field("team-a")}
-       })));
-       sort_key_column->insert(Field(Int64(1)));
+        obj_col.insert(Field(createObject({
+            {"service.name", Field("svc")},
+            {"service.version", Field("1.0")},
+            {"service.env", Field("prod")},
+            {"service.region", Field("us-east")},
+            {"service.owner", Field("team-a")}
+        })));
+        sort_key_column->insert(Field(Int64(1)));
 
-       const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
-       func->add(right, columns, 0, &arena);
-   }
+        const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+        func->add(right, columns, 0, &arena);
+    }
 
-   {
-       auto json_column = ColumnObject::create({}, 1024, 255);
-       auto & obj_col = assert_cast<ColumnObject &>(*json_column);
-       auto sort_key_column = DataTypeInt64().createColumn();
+    {
+        auto json_column = ColumnObject::create({}, 1024, 255);
+        auto & obj_col = assert_cast<ColumnObject &>(*json_column);
+        auto sort_key_column = DataTypeInt64().createColumn();
 
-       obj_col.insert(Field(createObject({
-           {"service.version", Field("2.0")},
-           {"service.region", Field("eu-west")},
-           {"other", Field("value")}
-       })));
-       sort_key_column->insert(Field(Int64(2)));
+        obj_col.insert(Field(createObject({
+            {"service.version", Field("2.0")},
+            {"service.region", Field("eu-west")},
+            {"other", Field("value")}
+        })));
+        sort_key_column->insert(Field(Int64(2)));
 
-       const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
-       func->add(left, columns, 0, &arena);
-   }
+        const IColumn * columns[] = {json_column.get(), sort_key_column.get()};
+        func->add(left, columns, 0, &arena);
+    }
 
-   WriteBufferFromOwnString write_buf;
-   func->serialize(right, write_buf, std::nullopt);
+    WriteBufferFromOwnString write_buf;
+    func->serialize(right, write_buf, std::nullopt);
 
-   ReadBufferFromString read_buf(write_buf.str());
-   func->deserialize(right_deserialized, read_buf, std::nullopt, &arena);
+    ReadBufferFromString read_buf(write_buf.str());
+    func->deserialize(right_deserialized, read_buf, std::nullopt, &arena);
 
-   func->merge(left, right_deserialized, &arena);
+    func->merge(left, right_deserialized, &arena);
 
-   auto result_column = func->getResultType()->createColumn();
-   func->insertResultInto(left, *result_column, &arena);
+    auto result_column = func->getResultType()->createColumn();
+    func->insertResultInto(left, *result_column, &arena);
 
-   Field result_field;
-   result_column->get(0, result_field);
-   const auto & result_obj = result_field.safeGet<Object>();
+    Field result_field;
+    result_column->get(0, result_field);
+    const auto & result_obj = result_field.safeGet<Object>();
 
-   ASSERT_TRUE(result_obj.contains("service"));
-   ASSERT_TRUE(result_obj.contains("other"));
+    ASSERT_TRUE(result_obj.contains("service"));
+    ASSERT_TRUE(result_obj.contains("other"));
 
-   const auto & service = result_obj.at("service").safeGet<Object>();
-   EXPECT_EQ(getStringFromObject(service, "name"), "svc");
-   EXPECT_EQ(getStringFromObject(service, "version"), "2.0");
-   EXPECT_EQ(getStringFromObject(service, "env"), "prod");
-   EXPECT_EQ(getStringFromObject(service, "region"), "eu-west");
-   EXPECT_EQ(getStringFromObject(service, "owner"), "team-a");
-   EXPECT_EQ(result_obj.at("other").safeGet<String>(), "value");
+    const auto & service = result_obj.at("service").safeGet<Object>();
+    EXPECT_EQ(getStringFromObject(service, "name"), "svc");
+    EXPECT_EQ(getStringFromObject(service, "version"), "2.0");
+    EXPECT_EQ(getStringFromObject(service, "env"), "prod");
+    EXPECT_EQ(getStringFromObject(service, "region"), "eu-west");
+    EXPECT_EQ(getStringFromObject(service, "owner"), "team-a");
+    EXPECT_EQ(result_obj.at("other").safeGet<String>(), "value");
 
-   func->destroy(left);
-   func->destroy(right);
-   func->destroy(right_deserialized);
+    func->destroy(left);
+    func->destroy(right);
+    func->destroy(right_deserialized);
 }
 
-TEST(AggregateFunctionMergedJSONPatch, RepeatedDisjointTopLevelOverlapWithSerializedStateMergesCorrectly)
+TEST(AggregateFunctionMergedJSONPatch, RepeatedMergeAfterDeserializePreservesDisjointUpdates)
 {
     tryRegisterAggregateFunctions();
 
     auto func = createMergedJSONPatchFunction(true);
 
     PODArray<char> base_buffer;
-    PODArray<char> serialized_buffer;
+    PODArray<char> deserialized_buffer;
     PODArray<char> patch_one_buffer;
     PODArray<char> patch_two_buffer;
     base_buffer.resize(func->sizeOfData());
-    serialized_buffer.resize(func->sizeOfData());
+    deserialized_buffer.resize(func->sizeOfData());
     patch_one_buffer.resize(func->sizeOfData());
     patch_two_buffer.resize(func->sizeOfData());
 
     AggregateDataPtr base = base_buffer.data();
-    AggregateDataPtr serialized = serialized_buffer.data();
+    AggregateDataPtr deserialized = deserialized_buffer.data();
     AggregateDataPtr patch_one = patch_one_buffer.data();
     AggregateDataPtr patch_two = patch_two_buffer.data();
     func->create(base);
-    func->create(serialized);
+    func->create(deserialized);
     func->create(patch_one);
     func->create(patch_two);
 
@@ -1101,7 +1095,7 @@ TEST(AggregateFunctionMergedJSONPatch, RepeatedDisjointTopLevelOverlapWithSerial
     func->serialize(base, write_buf, std::nullopt);
 
     ReadBufferFromString read_buf(write_buf.str());
-    func->deserialize(serialized, read_buf, std::nullopt, &arena);
+    func->deserialize(deserialized, read_buf, std::nullopt, &arena);
 
     {
         auto json_column = ColumnObject::create({}, 1024, 255);
@@ -1133,11 +1127,11 @@ TEST(AggregateFunctionMergedJSONPatch, RepeatedDisjointTopLevelOverlapWithSerial
         func->add(patch_two, columns, 0, &arena);
     }
 
-    func->merge(serialized, patch_one, &arena);
-    func->merge(serialized, patch_two, &arena);
+    func->merge(deserialized, patch_one, &arena);
+    func->merge(deserialized, patch_two, &arena);
 
     auto result_column = func->getResultType()->createColumn();
-    func->insertResultInto(serialized, *result_column, &arena);
+    func->insertResultInto(deserialized, *result_column, &arena);
 
     Field result_field;
     result_column->get(0, result_field);
@@ -1157,7 +1151,7 @@ TEST(AggregateFunctionMergedJSONPatch, RepeatedDisjointTopLevelOverlapWithSerial
     EXPECT_EQ(result_obj.at("other_two").safeGet<String>(), "value-2");
 
     func->destroy(base);
-    func->destroy(serialized);
+    func->destroy(deserialized);
     func->destroy(patch_one);
     func->destroy(patch_two);
 }
