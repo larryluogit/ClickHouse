@@ -258,21 +258,17 @@ struct AggregateFunctionMergedJSONPatchData
         /// In `mergedJSONPatch` we combine that with last-write-wins ordering: a whole-subtree replacement
         /// is allowed only if it is newer than every effective winner currently stored under that subtree.
         ///
-        /// To implement this without storing per-descendant summaries, each node tracks the maximum sort key
-        /// among effective winners in its current subtree. Parent replacement can then compare against a
-        /// single summary value:
-        /// - if `sort_key >= subtree_max_sort_key`, the whole replacement wins;
-        /// - otherwise the whole replacement loses.
-        ///
         /// Partial replacement is not allowed. If any effective descendant winner is newer, the parent write
         /// cannot replace only the older descendants; it must lose entirely.
+        ///
+        /// To keep per-node state smaller, we do not store a cached subtree summary. Instead, when a
+        /// non-object replacement is attempted, we scan the current subtree and reject the replacement if
+        /// any effective winner has a larger sort key.
         std::vector<Child> children;
         EncodedField terminal_value;
         SortKey terminal_sort_key;
-        SortKey subtree_max_sort_key;
         bool has_terminal_value = false;
         bool has_terminal_sort_key = false;
-        bool has_subtree_max_sort_key = false;
     };
 
     struct DebugPathScope
@@ -340,6 +336,25 @@ struct AggregateFunctionMergedJSONPatchData
         }
     }
 
+    EncodedField cloneEncodedField(const EncodedField & value)
+    {
+        switch (value.kind)
+        {
+            case EncodedField::Kind::Empty:
+                return EncodedField();
+            case EncodedField::Kind::Int64:
+                return EncodedField(value.inline_int64);
+            case EncodedField::Kind::UInt64:
+                return EncodedField(value.inline_uint64);
+            case EncodedField::Kind::String:
+            case EncodedField::Kind::BinaryNonObjectField:
+            case EncodedField::Kind::BinaryObjectField:
+                return EncodedField(value.kind, copyToArena(value_arena, value.data.view()));
+        }
+
+        UNREACHABLE();
+    }
+
     static bool isObjectField(const Field & value)
     {
         return value.getType() == Field::Types::Object;
@@ -378,37 +393,26 @@ struct AggregateFunctionMergedJSONPatchData
     {
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
-        node.has_subtree_max_sort_key = false;
         clearChildren(node);
     }
 
-    static void refreshSubtreeMaxSortKey(Node & node, const std::deque<Node> & nodes)
+    static bool subtreeHasNewerWinner(const Node & node, const SortKey & sort_key, const std::deque<Node> & nodes)
     {
-        node.has_subtree_max_sort_key = false;
-
-        if (node.has_terminal_sort_key)
-        {
-            node.subtree_max_sort_key = node.terminal_sort_key;
-            node.has_subtree_max_sort_key = true;
-        }
+        if (node.has_terminal_sort_key && sort_key < node.terminal_sort_key)
+            return true;
 
         for (const auto & child : node.children)
         {
-            const Node & child_node = nodes[child.node_index];
-            if (!child_node.has_subtree_max_sort_key)
-                continue;
-
-            if (!node.has_subtree_max_sort_key || node.subtree_max_sort_key < child_node.subtree_max_sort_key)
-            {
-                node.subtree_max_sort_key = child_node.subtree_max_sort_key;
-                node.has_subtree_max_sort_key = true;
-            }
+            if (subtreeHasNewerWinner(nodes[child.node_index], sort_key, nodes))
+                return true;
         }
+
+        return false;
     }
 
-    static bool subtreeReplacementWins(const Node & node, const SortKey & sort_key)
+    static bool subtreeReplacementWins(const Node & node, const SortKey & sort_key, const std::deque<Node> & nodes)
     {
-        return !node.has_subtree_max_sort_key || node.subtree_max_sort_key <= sort_key;
+        return !subtreeHasNewerWinner(node, sort_key, nodes);
     }
 
     Node & rootNode()
@@ -475,89 +479,6 @@ struct AggregateFunctionMergedJSONPatchData
         out = Field(std::move(object));
     }
 
-    static EncodedField cloneEncodedField(const EncodedField & src, AggregateFunctionMergedJSONPatchData & dst_owner)
-    {
-        switch (src.kind)
-        {
-            case EncodedField::Kind::Empty:
-                return EncodedField();
-            case EncodedField::Kind::Int64:
-                return EncodedField(src.inline_int64);
-            case EncodedField::Kind::UInt64:
-                return EncodedField(src.inline_uint64);
-            case EncodedField::Kind::String:
-            case EncodedField::Kind::BinaryNonObjectField:
-            case EncodedField::Kind::BinaryObjectField:
-                return EncodedField(src.kind, copyToArena(dst_owner.value_arena, src.data.view()));
-        }
-
-        UNREACHABLE();
-    }
-
-    static UInt32 cloneSubtree(const AggregateFunctionMergedJSONPatchData & src_owner, UInt32 src_node_index, AggregateFunctionMergedJSONPatchData & dst_owner)
-    {
-        const Node & src_node = src_owner.nodes[src_node_index];
-        Node & dst_node = dst_owner.appendNode();
-
-        dst_node.has_terminal_value = src_node.has_terminal_value;
-        dst_node.has_terminal_sort_key = src_node.has_terminal_sort_key;
-        dst_node.terminal_sort_key = src_node.terminal_sort_key;
-        dst_node.has_subtree_max_sort_key = src_node.has_subtree_max_sort_key;
-        dst_node.subtree_max_sort_key = src_node.subtree_max_sort_key;
-        if (src_node.has_terminal_value)
-            dst_node.terminal_value = cloneEncodedField(src_node.terminal_value, dst_owner);
-
-        dst_node.children.reserve(src_node.children.size());
-        for (const auto & src_child : src_node.children)
-        {
-            Child dst_child;
-            dst_child.name = copyToArena(dst_owner.string_arena, src_child.name.view());
-            dst_child.node_index = cloneSubtree(src_owner, src_child.node_index, dst_owner);
-            dst_node.children.push_back(dst_child);
-        }
-
-        return static_cast<UInt32>(dst_owner.nodes.size() - 1);
-    }
-
-    static void overwriteNodeWithSubtree(Node & dst, const AggregateFunctionMergedJSONPatchData & src_owner, UInt32 src_node_index, AggregateFunctionMergedJSONPatchData & dst_owner)
-    {
-        const Node & src_node = src_owner.nodes[src_node_index];
-
-        dst.children.clear();
-        dst.has_terminal_value = src_node.has_terminal_value;
-        dst.has_terminal_sort_key = src_node.has_terminal_sort_key;
-        dst.terminal_sort_key = src_node.terminal_sort_key;
-        dst.has_subtree_max_sort_key = src_node.has_subtree_max_sort_key;
-        dst.subtree_max_sort_key = src_node.subtree_max_sort_key;
-        dst.terminal_value = src_node.has_terminal_value ? cloneEncodedField(src_node.terminal_value, dst_owner) : EncodedField();
-
-        dst.children.reserve(src_node.children.size());
-        for (const auto & src_child : src_node.children)
-        {
-            Child dst_child;
-            dst_child.name = copyToArena(dst_owner.string_arena, src_child.name.view());
-            dst_child.node_index = cloneSubtree(src_owner, src_child.node_index, dst_owner);
-            dst.children.push_back(dst_child);
-        }
-    }
-
-    static bool canOverwriteWithSubtree(const Node & dst, const Node & src)
-    {
-        if (!src.has_terminal_sort_key)
-            return false;
-
-        if (dst.has_terminal_sort_key && dst.terminal_sort_key > src.terminal_sort_key)
-            return false;
-
-        if (!dst.children.empty())
-            return false;
-
-        if (!dst.has_terminal_value)
-            return true;
-
-        return !isObjectField(dst.terminal_value.get());
-    }
-
     static void mergeObjectIntoNode(Node & node, const Object & object, const SortKey & sort_key, AggregateFunctionMergedJSONPatchData & owner)
     {
         if (node.has_terminal_sort_key && node.terminal_sort_key > sort_key)
@@ -576,16 +497,14 @@ struct AggregateFunctionMergedJSONPatchData
 
         if (!isObjectField(value))
         {
-            if (!subtreeReplacementWins(node, sort_key))
+            if (!subtreeReplacementWins(node, sort_key, nodes))
                 return;
 
             clearChildren(node);
             node.terminal_value = encodeFieldToArena(std::move(value));
             node.terminal_sort_key = sort_key;
-            node.subtree_max_sort_key = sort_key;
             node.has_terminal_value = true;
             node.has_terminal_sort_key = true;
-            node.has_subtree_max_sort_key = true;
             return;
         }
 
@@ -605,9 +524,6 @@ struct AggregateFunctionMergedJSONPatchData
         splitPath(path, parts);
 
         Node * current = &start_node;
-        std::vector<Node *> visited_nodes;
-        visited_nodes.reserve(parts.size() + 1);
-        visited_nodes.push_back(current);
 
         for (size_t i = 0; i < parts.size(); ++i)
         {
@@ -619,61 +535,15 @@ struct AggregateFunctionMergedJSONPatchData
                 clearNodeSubtree(*current);
 
             current = &getOrCreateChild(*current, parts[i]);
-            visited_nodes.push_back(current);
 
             if (is_last)
                 insertField(*current, std::move(value), sort_key);
         }
-
-        for (auto it = visited_nodes.rbegin(); it != visited_nodes.rend(); ++it)
-            refreshSubtreeMaxSortKey(**it, nodes);
     }
 
     void insertPathValue(std::string_view path, Field value, const SortKey & sort_key)
     {
         insertPathValue(rootNode(), path, std::move(value), sort_key);
-    }
-
-    static bool copyTerminalValueIfDominates(Node & dst, const Node & src, AggregateFunctionMergedJSONPatchData & dst_owner)
-    {
-        if (!src.has_terminal_value || !src.has_terminal_sort_key)
-            return false;
-
-        if (src.terminal_value.kind == EncodedField::Kind::BinaryObjectField)
-            return false;
-
-        if (dst.has_terminal_sort_key && dst.terminal_sort_key > src.terminal_sort_key)
-            return true;
-
-        clearChildren(dst);
-
-        switch (src.terminal_value.kind)
-        {
-            case EncodedField::Kind::Empty:
-                dst.terminal_value = EncodedField();
-                break;
-            case EncodedField::Kind::Int64:
-                dst.terminal_value = EncodedField(src.terminal_value.inline_int64);
-                break;
-            case EncodedField::Kind::UInt64:
-                dst.terminal_value = EncodedField(src.terminal_value.inline_uint64);
-                break;
-            case EncodedField::Kind::String:
-            case EncodedField::Kind::BinaryNonObjectField:
-                dst.terminal_value = EncodedField(
-                    src.terminal_value.kind,
-                    copyToArena(dst_owner.value_arena, src.terminal_value.data.view()));
-                break;
-            case EncodedField::Kind::BinaryObjectField:
-                UNREACHABLE();
-        }
-
-        dst.terminal_sort_key = src.terminal_sort_key;
-        dst.subtree_max_sort_key = src.terminal_sort_key;
-        dst.has_terminal_value = true;
-        dst.has_terminal_sort_key = true;
-        dst.has_subtree_max_sort_key = true;
-        return true;
     }
 
     static bool subtreeDominatedByNonObjectTerminal(const Node & node, const SortKey & ancestor_sort_key)
@@ -689,11 +559,22 @@ struct AggregateFunctionMergedJSONPatchData
 
     static void mergeNode(Node & dst, const Node & src, const AggregateFunctionMergedJSONPatchData & src_owner, AggregateFunctionMergedJSONPatchData & dst_owner)
     {
-        if (copyTerminalValueIfDominates(dst, src, dst_owner))
-            return;
-
         if (src.has_terminal_value && src.has_terminal_sort_key)
         {
+            if (src.terminal_value.kind != EncodedField::Kind::BinaryObjectField)
+            {
+                if (!dst.has_terminal_sort_key || dst.terminal_sort_key <= src.terminal_sort_key)
+                {
+                    clearChildren(dst);
+                    dst.terminal_value = dst_owner.cloneEncodedField(src.terminal_value);
+                    dst.terminal_sort_key = src.terminal_sort_key;
+                    dst.has_terminal_value = true;
+                    dst.has_terminal_sort_key = true;
+                }
+
+                return;
+            }
+
             Field src_value = src.terminal_value.get();
             if (!dst.has_terminal_sort_key || dst.terminal_sort_key <= src.terminal_sort_key)
                 mergeObjectIntoNode(dst, src_value.safeGet<Object>(), src.terminal_sort_key, dst_owner);
@@ -718,39 +599,10 @@ struct AggregateFunctionMergedJSONPatchData
             if (subtreeDominatedByNonObjectTerminal(dst, src_child_node.terminal_sort_key))
                 continue;
 
-            auto it = std::lower_bound(
-                dst.children.begin(),
-                dst.children.end(),
-                src_child.name.view(),
-                childNameLess);
-
-            if (it == dst.children.end() || it->name.view() != src_child.name.view())
-            {
-                if (canOverwriteWithSubtree(dst, src_child_node))
-                {
-                    Child child;
-                    child.name = copyToArena(dst_owner.string_arena, src_child.name.view());
-                    child.node_index = cloneSubtree(src_owner, src_child.node_index, dst_owner);
-                    dst.children.insert(it, std::move(child));
-                    continue;
-                }
-
-                Node & dst_child = dst_owner.getOrCreateChild(dst, src_child.name.view());
-                mergeNode(dst_child, src_child_node, src_owner, dst_owner);
-                continue;
-            }
-
-            Node & dst_child = dst_owner.nodes[it->node_index];
-            if (canOverwriteWithSubtree(dst_child, src_child_node))
-            {
-                overwriteNodeWithSubtree(dst_child, src_owner, src_child.node_index, dst_owner);
-                continue;
-            }
-
+            Node & dst_child = dst_owner.getOrCreateChild(dst, src_child.name.view());
             mergeNode(dst_child, src_child_node, src_owner, dst_owner);
         }
 
-        refreshSubtreeMaxSortKey(dst, dst_owner.nodes);
     }
 
     void serializeNode(const Node & node, WriteBuffer & buf) const
@@ -866,11 +718,9 @@ struct AggregateFunctionMergedJSONPatchData
 
             Field terminal_sort_key = decodeField(buf);
             node.terminal_sort_key = SortKey(std::move(terminal_sort_key));
-            node.subtree_max_sort_key = node.terminal_sort_key;
 
             node.has_terminal_value = true;
             node.has_terminal_sort_key = true;
-            node.has_subtree_max_sort_key = true;
         }
 
         size_t children_size = 0;
@@ -889,14 +739,12 @@ struct AggregateFunctionMergedJSONPatchData
             deserializeNodeExpanded(child, buf, owner);
         }
 
-        refreshSubtreeMaxSortKey(node, owner.nodes);
     }
 
     void deserializeNode(Node & node, ReadBuffer & buf)
     {
         node.has_terminal_value = false;
         node.has_terminal_sort_key = false;
-        node.has_subtree_max_sort_key = false;
         node.terminal_value = EncodedField();
         node.children.clear();
 
