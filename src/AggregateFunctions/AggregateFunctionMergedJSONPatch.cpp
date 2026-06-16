@@ -147,21 +147,6 @@ struct AggregateFunctionMergedJSONPatchData
         }
     };
 
-    static constexpr bool merged_json_patch_debug_logging = true;
-
-    static String debugPathToString(const std::vector<String> & path)
-    {
-        String result;
-        for (size_t i = 0; i < path.size(); ++i)
-        {
-            if (i != 0)
-                result += ".";
-            result += path[i];
-        }
-        return result;
-    }
-
-
     struct EncodedField
     {
         enum class Kind : UInt8
@@ -271,24 +256,6 @@ struct AggregateFunctionMergedJSONPatchData
         bool has_terminal_sort_key = false;
     };
 
-    struct DebugPathScope
-    {
-        std::vector<String> * stack = nullptr;
-
-        DebugPathScope(std::vector<String> * stack_, std::string_view name)
-            : stack(stack_)
-        {
-            if (stack)
-                stack->emplace_back(name);
-        }
-
-        ~DebugPathScope()
-        {
-            if (stack)
-                stack->pop_back();
-        }
-    };
-
     StringSlice copyPathSegment(std::string_view data)
     {
         return copyToArena(string_arena, data);
@@ -297,7 +264,6 @@ struct AggregateFunctionMergedJSONPatchData
     Arena string_arena;
     Arena value_arena;
     std::deque<Node> nodes;
-    mutable std::vector<String> debug_deserialize_path;
 
     AggregateFunctionMergedJSONPatchData()
     {
@@ -607,17 +573,6 @@ struct AggregateFunctionMergedJSONPatchData
 
     void serializeNode(const Node & node, WriteBuffer & buf) const
     {
-        if constexpr (merged_json_patch_debug_logging)
-        {
-            if (node.has_terminal_value && !node.children.empty())
-            {
-                throw Exception(
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                    "Invariant violation in `mergedJSONPatch`: terminal node has {} children before serialization",
-                    node.children.size());
-            }
-        }
-
         writeBoolText(node.has_terminal_value, buf);
         if (node.has_terminal_value)
         {
@@ -660,21 +615,18 @@ struct AggregateFunctionMergedJSONPatchData
             readBinary(encoded_kind, buf);
 
             auto kind = static_cast<EncodedField::Kind>(encoded_kind);
-            if constexpr (merged_json_patch_debug_logging)
+
+            if (kind != EncodedField::Kind::Empty
+                && kind != EncodedField::Kind::Int64
+                && kind != EncodedField::Kind::UInt64
+                && kind != EncodedField::Kind::String
+                && kind != EncodedField::Kind::BinaryNonObjectField
+                && kind != EncodedField::Kind::BinaryObjectField)
             {
-                if (kind != EncodedField::Kind::Empty
-                    && kind != EncodedField::Kind::Int64
-                    && kind != EncodedField::Kind::UInt64
-                    && kind != EncodedField::Kind::String
-                    && kind != EncodedField::Kind::BinaryNonObjectField
-                    && kind != EncodedField::Kind::BinaryObjectField)
-                {
-                    throw Exception(
-                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                        "Invalid terminal kind while deserializing `mergedJSONPatch` at path '{}': byte={}",
-                        debugPathToString(owner.debug_deserialize_path),
-                        static_cast<UInt64>(encoded_kind));
-                }
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "Invalid terminal kind while deserializing `mergedJSONPatch`: byte={}",
+                    static_cast<UInt64>(encoded_kind));
             }
 
             switch (kind)
@@ -735,7 +687,6 @@ struct AggregateFunctionMergedJSONPatchData
             readStringBinary(key, buf);
 
             Node & child = owner.appendChild(node, key);
-            DebugPathScope path_scope(merged_json_patch_debug_logging ? &owner.debug_deserialize_path : nullptr, key);
             deserializeNodeExpanded(child, buf, owner);
         }
 
@@ -823,7 +774,6 @@ struct AggregateFunctionMergedJSONPatchData
     {
         nodes.clear();
         nodes.emplace_back();
-        debug_deserialize_path.clear();
         deserializeNode(rootNode(), buf);
     }
 
