@@ -604,81 +604,95 @@ struct AggregateFunctionMergedJSONPatchData
         }
     }
 
-    static void deserializeNodeExpanded(Node & node, ReadBuffer & buf, AggregateFunctionMergedJSONPatchData & owner)
+    static EncodedField readEncodedField(ReadBuffer & buf, AggregateFunctionMergedJSONPatchData & owner)
+    {
+        UInt8 encoded_kind = 0;
+        readBinary(encoded_kind, buf);
+
+        auto kind = static_cast<EncodedField::Kind>(encoded_kind);
+
+        if (kind != EncodedField::Kind::Empty
+            && kind != EncodedField::Kind::Int64
+            && kind != EncodedField::Kind::UInt64
+            && kind != EncodedField::Kind::String
+            && kind != EncodedField::Kind::BinaryNonObjectField
+            && kind != EncodedField::Kind::BinaryObjectField)
+        {
+            throw Exception(
+                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                "Invalid terminal kind while deserializing `mergedJSONPatch`: byte={}",
+                static_cast<UInt64>(encoded_kind));
+        }
+
+        switch (kind)
+        {
+            case EncodedField::Kind::Empty:
+                return EncodedField();
+            case EncodedField::Kind::Int64:
+            {
+                Int64 value = 0;
+                readVarInt(value, buf);
+                return EncodedField(value);
+            }
+            case EncodedField::Kind::UInt64:
+            {
+                UInt64 value = 0;
+                readVarUInt(value, buf);
+                return EncodedField(value);
+            }
+            case EncodedField::Kind::String:
+            case EncodedField::Kind::BinaryNonObjectField:
+            case EncodedField::Kind::BinaryObjectField:
+            {
+                size_t value_size = 0;
+                readVarUInt(value_size, buf);
+
+                StringSlice stored = {};
+                if (value_size)
+                {
+                    char * dst = owner.value_arena.alloc(value_size);
+                    buf.readStrict(dst, value_size);
+                    stored = StringSlice(dst, value_size);
+                }
+
+                return EncodedField(kind, stored);
+            }
+        }
+
+        UNREACHABLE();
+    }
+
+    static void mergeDeserializedNodeInto(Node & dst, ReadBuffer & buf, AggregateFunctionMergedJSONPatchData & owner)
     {
         bool has_terminal = false;
         readBoolText(has_terminal, buf);
 
         if (has_terminal)
         {
-            UInt8 encoded_kind = 0;
-            readBinary(encoded_kind, buf);
+            EncodedField terminal_value = readEncodedField(buf, owner);
+            SortKey terminal_sort_key = SortKey(decodeField(buf));
 
-            auto kind = static_cast<EncodedField::Kind>(encoded_kind);
-
-            if (kind != EncodedField::Kind::Empty
-                && kind != EncodedField::Kind::Int64
-                && kind != EncodedField::Kind::UInt64
-                && kind != EncodedField::Kind::String
-                && kind != EncodedField::Kind::BinaryNonObjectField
-                && kind != EncodedField::Kind::BinaryObjectField)
+            if (terminal_value.kind != EncodedField::Kind::BinaryObjectField)
             {
-                throw Exception(
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                    "Invalid terminal kind while deserializing `mergedJSONPatch`: byte={}",
-                    static_cast<UInt64>(encoded_kind));
-            }
-
-            switch (kind)
-            {
-                case EncodedField::Kind::Empty:
-                    node.terminal_value = EncodedField();
-                    break;
-                case EncodedField::Kind::Int64:
+                if (!dst.has_terminal_sort_key || dst.terminal_sort_key <= terminal_sort_key)
                 {
-                    Int64 value = 0;
-                    readVarInt(value, buf);
-                    node.terminal_value = EncodedField(value);
-                    break;
-                }
-                case EncodedField::Kind::UInt64:
-                {
-                    UInt64 value = 0;
-                    readVarUInt(value, buf);
-                    node.terminal_value = EncodedField(value);
-                    break;
-                }
-                case EncodedField::Kind::String:
-                case EncodedField::Kind::BinaryNonObjectField:
-                case EncodedField::Kind::BinaryObjectField:
-                {
-                    size_t value_size = 0;
-                    readVarUInt(value_size, buf);
-
-                    StringSlice stored = {};
-                    if (value_size)
-                    {
-                        char * dst = owner.value_arena.alloc(value_size);
-                        buf.readStrict(dst, value_size);
-                        stored = StringSlice(dst, value_size);
-                    }
-
-                    node.terminal_value = EncodedField(kind, stored);
-                    break;
+                    clearChildren(dst);
+                    dst.terminal_value = std::move(terminal_value);
+                    dst.terminal_sort_key = std::move(terminal_sort_key);
+                    dst.has_terminal_value = true;
+                    dst.has_terminal_sort_key = true;
                 }
             }
-
-            Field terminal_sort_key = decodeField(buf);
-            node.terminal_sort_key = SortKey(std::move(terminal_sort_key));
-
-            node.has_terminal_value = true;
-            node.has_terminal_sort_key = true;
+            else
+            {
+                Field src_value = terminal_value.get();
+                if (!dst.has_terminal_sort_key || dst.terminal_sort_key <= terminal_sort_key)
+                    mergeObjectIntoNode(dst, src_value.safeGet<Object>(), terminal_sort_key, owner);
+            }
         }
 
         size_t children_size = 0;
         readVarUInt(children_size, buf);
-        node.children.clear();
-        node.children.reserve(children_size);
 
         String key;
         for (size_t i = 0; i < children_size; ++i)
@@ -686,10 +700,9 @@ struct AggregateFunctionMergedJSONPatchData
             key.clear();
             readStringBinary(key, buf);
 
-            Node & child = owner.appendChild(node, key);
-            deserializeNodeExpanded(child, buf, owner);
+            Node & child = owner.getOrCreateChild(dst, key);
+            mergeDeserializedNodeInto(child, buf, owner);
         }
-
     }
 
     void deserializeNode(Node & node, ReadBuffer & buf)
@@ -699,7 +712,7 @@ struct AggregateFunctionMergedJSONPatchData
         node.terminal_value = EncodedField();
         node.children.clear();
 
-        deserializeNodeExpanded(node, buf, *this);
+        mergeDeserializedNodeInto(node, buf, *this);
     }
 
     void collectObject(const Node & node, Object & out) const
