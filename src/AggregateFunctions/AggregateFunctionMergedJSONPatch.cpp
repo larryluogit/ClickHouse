@@ -392,16 +392,6 @@ struct AggregateFunctionMergedJSONPatchData
         return nodes[it->node_index];
     }
 
-    Node & appendChild(Node & node, std::string_view name)
-    {
-        Child child;
-        child.name = copyPathSegment(name);
-        child.node_index = static_cast<UInt32>(nodes.size());
-        appendNode();
-        node.children.push_back(std::move(child));
-        return nodes[node.children.back().node_index];
-    }
-
     void buildFieldFromNode(const Node & node, Field & out) const
     {
         if (node.has_terminal_value)
