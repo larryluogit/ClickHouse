@@ -841,13 +841,10 @@ TEST(AggregateFunctionMergedJSONPatch, RepeatedSamePathUpdatesDoNotAccumulateSta
     EXPECT_EQ(getStringFromObject(result_obj, "name"), "stable");
 
     ReadBufferFromString read_buf(write_buf.str());
-    bool has_terminal = false;
-    readBoolText(has_terminal, read_buf);
-    EXPECT_FALSE(has_terminal);
 
-    size_t root_children = 0;
-    readVarUInt(root_children, read_buf);
-    EXPECT_EQ(root_children, 2);
+    size_t entry_count = 0;
+    readVarUInt(entry_count, read_buf);
+    EXPECT_EQ(entry_count, 2);
 
     func->destroy(place);
 }
@@ -929,32 +926,21 @@ TEST(AggregateFunctionMergedJSONPatch, MergeOfCompactedStatesKeepsOnlyWinningEnt
     ReadBufferFromString read_left(left_buf.str());
     ReadBufferFromString read_right(right_buf.str());
 
-    bool left_has_terminal = false;
-    bool right_has_terminal = false;
-    readBoolText(left_has_terminal, read_left);
-    readBoolText(right_has_terminal, read_right);
-    EXPECT_FALSE(left_has_terminal);
-    EXPECT_FALSE(right_has_terminal);
+    size_t left_entries = 0;
+    size_t right_entries = 0;
+    readVarUInt(left_entries, read_left);
+    readVarUInt(right_entries, read_right);
 
-    size_t left_children = 0;
-    size_t right_children = 0;
-    readVarUInt(left_children, read_left);
-    readVarUInt(right_children, read_right);
-
-    EXPECT_EQ(left_children, 2);
-    EXPECT_EQ(right_children, 2);
+    EXPECT_EQ(left_entries, 2);
+    EXPECT_EQ(right_entries, 2);
 
     WriteBufferFromOwnString merged_buf;
     func->serialize(left, merged_buf, std::nullopt);
     ReadBufferFromString merged_read(merged_buf.str());
 
-    bool merged_has_terminal = false;
-    readBoolText(merged_has_terminal, merged_read);
-    EXPECT_FALSE(merged_has_terminal);
-
-    size_t merged_children = 0;
-    readVarUInt(merged_children, merged_read);
-    EXPECT_EQ(merged_children, 3);
+    size_t merged_entries = 0;
+    readVarUInt(merged_entries, merged_read);
+    EXPECT_EQ(merged_entries, 3);
 
     func->destroy(left);
     func->destroy(right);
@@ -1156,7 +1142,7 @@ TEST(AggregateFunctionMergedJSONPatch, RepeatedMergeAfterDeserializePreservesDis
     func->destroy(patch_two);
 }
 
-TEST(AggregateFunctionMergedJSONPatch, WideSubtreeSerializesAsNestedTree)
+TEST(AggregateFunctionMergedJSONPatch, WideStateSerializesAsFlatEntries)
 {
     tryRegisterAggregateFunctions();
 
@@ -1188,25 +1174,13 @@ TEST(AggregateFunctionMergedJSONPatch, WideSubtreeSerializesAsNestedTree)
 
     ReadBufferFromString read_buf(write_buf.str());
 
-    bool root_has_terminal = false;
-    readBoolText(root_has_terminal, read_buf);
-    EXPECT_FALSE(root_has_terminal);
+    size_t entry_count = 0;
+    readVarUInt(entry_count, read_buf);
+    EXPECT_EQ(entry_count, 4);
 
-    size_t root_children = 0;
-    readVarUInt(root_children, read_buf);
-    EXPECT_EQ(root_children, 1);
-
-    String root_child_name;
-    readStringBinary(root_child_name, read_buf);
-    EXPECT_EQ(root_child_name, "data");
-
-    bool data_has_terminal = false;
-    readBoolText(data_has_terminal, read_buf);
-    EXPECT_FALSE(data_has_terminal);
-
-    size_t data_children = 0;
-    readVarUInt(data_children, read_buf);
-    EXPECT_EQ(data_children, 1);
+    String path;
+    readStringBinary(path, read_buf);
+    EXPECT_EQ(path, "data.runtime.nodejs.dependencies.lodash");
 
     func->destroy(place);
 }
