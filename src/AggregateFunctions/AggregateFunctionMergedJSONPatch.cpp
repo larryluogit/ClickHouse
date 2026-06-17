@@ -77,50 +77,27 @@ struct AggregateFunctionMergedJSONPatchData
     struct SortKey
     {
         Field value;
-        bool is_inline_int = false;
-        Int64 inline_int = 0;
 
         SortKey() = default;
 
         explicit SortKey(Field value_)
             : value(std::move(value_))
         {
-            if (value.getType() == Field::Types::Int64)
-            {
-                inline_int = value.safeGet<Int64>();
-                value = Field();
-                is_inline_int = true;
-            }
-            else if (value.getType() == Field::Types::UInt64)
-            {
-                inline_int = static_cast<Int64>(value.safeGet<UInt64>());
-                value = Field();
-                is_inline_int = true;
-            }
         }
 
-        Field toField() const
+        const Field & toField() const
         {
-            if (is_inline_int)
-                return Field(inline_int);
-
             return value;
         }
 
         bool operator<(const SortKey & other) const
         {
-            if (is_inline_int && other.is_inline_int)
-                return inline_int < other.inline_int;
-
-            return toField() < other.toField();
+            return value < other.value;
         }
 
         bool operator<=(const SortKey & other) const
         {
-            if (is_inline_int && other.is_inline_int)
-                return inline_int <= other.inline_int;
-
-            return toField() <= other.toField();
+            return value <= other.value;
         }
 
         bool operator>(const SortKey & other) const
