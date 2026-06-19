@@ -247,21 +247,28 @@ struct AggregateFunctionMergedJSONPatchData
         return value.getType() == Field::Types::Object;
     }
 
-    static bool isPrefixPath(std::string_view prefix, std::string_view path)
+    static bool isDescendantPath(std::string_view ancestor, std::string_view path)
     {
-        return path.size() > prefix.size()
-            && path.starts_with(prefix)
-            && path[prefix.size()] == '.';
+        return path.size() > ancestor.size()
+            && path.starts_with(ancestor)
+            && path[ancestor.size()] == '.';
     }
 
     static bool pathsConflict(std::string_view lhs, std::string_view rhs)
     {
-        return lhs == rhs || isPrefixPath(lhs, rhs) || isPrefixPath(rhs, lhs);
+        return lhs == rhs || isDescendantPath(lhs, rhs) || isDescendantPath(rhs, lhs);
     }
 
-    static bool pathLess(const Entry & entry, std::string_view path)
+    static auto findInsertPosition(std::vector<Entry> & entries, std::string_view path)
     {
-        return entry.path.view() < path;
+        return std::lower_bound(
+            entries.begin(),
+            entries.end(),
+            path,
+            [](const Entry & entry, std::string_view rhs_path)
+            {
+                return entry.path.view() < rhs_path;
+            });
     }
 
     static void insertNestedPath(Object & root, std::string_view path, Field value)
@@ -307,24 +314,8 @@ struct AggregateFunctionMergedJSONPatchData
             entries.end());
     }
 
-    void insertLeafPathValue(std::string_view path, Field value, const SortKey & sort_key)
+    void insertLeafEntry(std::string_view path, Field value, const SortKey & sort_key)
     {
-        normalizeMixedJSONArray(value);
-
-        if (isObjectField(value))
-        {
-            const auto & object = value.safeGet<Object>();
-            for (const auto & [child_key, child_value] : object)
-            {
-                String child_path(path);
-                if (!child_path.empty())
-                    child_path += '.';
-                child_path += child_key;
-                insertLeafPathValue(child_path, child_value, sort_key);
-            }
-            return;
-        }
-
         if (hasNewerConflictingEntry(path, sort_key))
             return;
 
@@ -335,13 +326,29 @@ struct AggregateFunctionMergedJSONPatchData
         entry.value = encodeFieldToArena(std::move(value));
         entry.sort_key = sort_key;
 
-        auto it = std::lower_bound(entries.begin(), entries.end(), path, pathLess);
+        auto it = findInsertPosition(entries, path);
         entries.insert(it, std::move(entry));
     }
 
     void insertPathValue(std::string_view path, Field value, const SortKey & sort_key)
     {
-        insertLeafPathValue(path, std::move(value), sort_key);
+        normalizeMixedJSONArray(value);
+
+        if (!isObjectField(value))
+        {
+            insertLeafEntry(path, std::move(value), sort_key);
+            return;
+        }
+
+        const auto & object = value.safeGet<Object>();
+        for (const auto & [child_key, child_value] : object)
+        {
+            String child_path(path);
+            if (!child_path.empty())
+                child_path += '.';
+            child_path += child_key;
+            insertPathValue(child_path, child_value, sort_key);
+        }
     }
 
     static EncodedField readEncodedField(ReadBuffer & buf, AggregateFunctionMergedJSONPatchData & owner)
@@ -658,4 +665,3 @@ SELECT mergedJSONPatch(json, sort_key) FROM
 
 }
 
-// Made with Bob
