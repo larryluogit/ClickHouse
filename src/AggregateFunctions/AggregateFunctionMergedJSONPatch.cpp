@@ -25,6 +25,15 @@ namespace ErrorCodes
 }
 
 
+/** `mergedJSONPatch` stores the effective last-write-wins view of RFC 7396-style replacements over
+  * `JSON` values. Each update is ordered by its sort key, and newer writes replace older writes for
+  * the same path or any ancestor/descendant conflicting path.
+  *
+  * It also inherits one important `ColumnObject` limitation: null-valued object members are dropped
+  * on insertion. As a result, RFC 7396 null deletion semantics such as `{"key": null}` are not
+  * representable here, because `ColumnObject` cannot distinguish between "key is absent" and
+  * "key has null value".
+  */
 struct AggregateFunctionMergedJSONPatchData
 {
     /// `JSON` / `ColumnObject` cannot insert arrays that mix scalar elements with nested `JSON`
@@ -65,11 +74,6 @@ struct AggregateFunctionMergedJSONPatchData
         }
     }
 
-    /// LIMITATION: RFC 7396 null deletion semantics (where `{"key": null}` removes a key) are NOT supported.
-    /// When a JSON object like `{"key": null}` is inserted into `ColumnObject`, the null-valued
-    /// key is silently dropped. `ColumnObject` cannot distinguish between "key is absent" and
-    /// "key has null value", treating them as equivalent. Therefore, this aggregate function
-    /// cannot detect or handle null deletion.
     struct SortKey
     {
         Field value;
