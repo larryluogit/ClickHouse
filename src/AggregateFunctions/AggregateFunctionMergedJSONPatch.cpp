@@ -18,6 +18,10 @@
 namespace DB
 {
 
+static AggregateFunctionPtr createAggregateFunctionMergedJSONPatch(
+    const std::string & name, const DataTypes & argument_types, const Array & parameters, const Settings *);
+void registerAggregateFunctionMergedJSONPatch(AggregateFunctionFactory & factory);
+
 namespace ErrorCodes
 {
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
@@ -568,7 +572,7 @@ public:
 };
 
 
-AggregateFunctionPtr createAggregateFunctionMergedJSONPatch(
+static AggregateFunctionPtr createAggregateFunctionMergedJSONPatch(
     const std::string & name, const DataTypes & argument_types, const Array & parameters, const Settings *)
 {
     assertNoParameters(name, parameters);
@@ -590,7 +594,6 @@ AggregateFunctionPtr createAggregateFunctionMergedJSONPatch(
 
     return std::make_shared<AggregateFunctionMergedJSONPatch>(argument_types);
 }
-
 
 void registerAggregateFunctionMergedJSONPatch(AggregateFunctionFactory & factory)
 {
