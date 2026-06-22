@@ -194,7 +194,7 @@ struct AggregateFunctionMergedJSONPatchData
         SortKey sort_key;
     };
 
-    Arena string_arena;
+    Arena path_arena;
     Arena value_arena;
     std::vector<Entry> entries;
 
@@ -210,7 +210,7 @@ struct AggregateFunctionMergedJSONPatchData
 
     StringSlice copyPath(std::string_view path)
     {
-        return copyToArena(string_arena, path);
+        return copyToArena(path_arena, path);
     }
 
     EncodedField encodeFieldToArena(Field value)
